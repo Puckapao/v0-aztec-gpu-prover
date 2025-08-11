@@ -5,6 +5,12 @@ if(DISABLE_ADX)
     target_compile_definitions(ecc PRIVATE -DDISABLE_ADX)
 endif()
 
+# Conditionally add CUDA support
+if(ENABLE_CUDA)
+    target_sources(ecc PRIVATE ../gpu/msm_cuda.cu)
+    target_link_libraries(ecc PRIVATE ${CUDA_LIBRARIES})
+endif()
+
 target_precompile_headers(
     ecc
     PUBLIC

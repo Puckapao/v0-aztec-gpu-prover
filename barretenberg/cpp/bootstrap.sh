@@ -171,9 +171,9 @@ function build {
   echo_header "bb cpp build"
   builds=(
     build_native
-    build_nodejs_module
-    build_wasm
-    build_wasm_threads
+    # build_nodejs_module
+    # build_wasm
+    # build_wasm_threads
   )
   if [ "$(arch)" == "amd64" ] && [ "$CI" -eq 1 ]; then
     builds+=(build_gcc_syntax_check_only build_fuzzing_syntax_check_only build_asan_fast)

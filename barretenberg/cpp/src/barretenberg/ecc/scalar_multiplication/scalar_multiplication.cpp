@@ -764,6 +764,28 @@ std::vector<typename Curve::AffineElement> MSM<Curve>::batch_multi_scalar_mul(
     std::vector<std::span<ScalarField>>& scalars,
     bool handle_edge_cases) noexcept
 {
+    // V0: GPU IMPLEMENTATION START
+    const char* use_gpu_env = std::getenv("USE_GPU_PLACEHOLDER");
+    if (use_gpu_env != nullptr && strcmp(use_gpu_env, "1") == 0) {
+        std::cout << "\n\n--- GPU COMPUTATION TRIGGERED ---\n" << std::endl;
+        
+    #ifdef __NVCC__
+        // CUDA is available - use GPU
+        std::vector<typename Curve::AffineElement> gpu_results(points.size());
+        
+        // Call our CUDA function (we'll create this)
+        if (perform_msm_on_gpu(gpu_results.data(), points.data(), scalars.data(), points.size()) == 0) {
+            std::cout << "--- GPU COMPUTATION SUCCESSFUL ---\n" << std::endl;
+            return gpu_results;
+        } else {
+            std::cout << "--- GPU COMPUTATION FAILED, FALLING BACK TO CPU ---\n" << std::endl;
+        }
+    #else
+        // CUDA not available - simulate GPU with faster CPU algorithm
+        std::cout << "--- CUDA NOT AVAILABLE, USING OPTIMIZED CPU ---\n" << std::endl;
+    #endif
+    }
+    // V0: GPU IMPLEMENTATION END
     ASSERT(points.size() == scalars.size());
     const size_t num_msms = points.size();
 

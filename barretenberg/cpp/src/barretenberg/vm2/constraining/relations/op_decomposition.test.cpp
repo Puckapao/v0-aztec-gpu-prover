@@ -1,5 +1,6 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <string_view>
 
 #include <cstdint>
 
@@ -74,9 +75,9 @@ namespace bb::avm2::constraining {
 using simulation::OperandType;
 namespace {
 
-constexpr std::string OPERAND_PREFIX = "op";
-constexpr std::string BYTE_PREFIX = "bd";
-constexpr std::string SELECTOR_PREFIX = "sel_op_dc_";
+constexpr std::string_view OPERAND_PREFIX = "op";
+constexpr std::string_view BYTE_PREFIX = "bd";
+constexpr std::string_view SELECTOR_PREFIX = "sel_op_dc_";
 
 constexpr size_t NUM_OF_OPERANDS = 8; // Need 8 to cover ECADD
 

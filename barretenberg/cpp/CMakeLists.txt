@@ -9,6 +9,16 @@ project(
     LANGUAGES CXX C
 )
 
+# Optional CUDA support
+option(ENABLE_CUDA "Enable CUDA support for GPU acceleration" OFF)
+
+if(ENABLE_CUDA)
+    enable_language(CUDA)
+    # Force GCC as CUDA host compiler to avoid clang compatibility issues
+    set(CMAKE_CUDA_HOST_COMPILER gcc)
+    message(STATUS "CUDA enabled with GCC host compiler")
+endif()
+
 # Add doxygen build command
 find_package(Doxygen)
 if (DOXYGEN_FOUND)

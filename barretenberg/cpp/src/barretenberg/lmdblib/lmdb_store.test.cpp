@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <gtest/gtest.h>
+#include <thread>
 
 #include <chrono>
 #include <cstdlib>
