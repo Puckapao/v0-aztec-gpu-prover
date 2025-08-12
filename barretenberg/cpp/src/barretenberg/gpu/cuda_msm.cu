@@ -17,7 +17,7 @@ extern "C" {
  * @param num_points The number of points/scalars.
  * @return int 0 on success, non-zero on failure.
  */
-int perform_msm_on_gpu(void* result, const void* points, const void* scalars, size_t num_points) {
+int cuda_msm_compute(void* result, const void* points, const void* scalars, size_t num_points) {
     std::cout << "GPU MSM: Processing " << num_points << " points" << std::endl;
     
     // For now, we'll use simplified data types
@@ -30,15 +30,14 @@ int perform_msm_on_gpu(void* result, const void* points, const void* scalars, si
     size_t points_bytes = num_points * point_size;
     size_t scalars_bytes = num_points * scalar_size;
     size_t result_bytes = num_points * point_size; // Same size as input points
-    
     cudaError_t err;
-
+    
     err = cudaMalloc(&d_points, points_bytes);
     if (err != cudaSuccess) { 
         std::cerr << "Failed to allocate d_points: " << cudaGetErrorString(err) << std::endl; 
         return 1; 
     }
-
+    
     err = cudaMalloc(&d_scalars, scalars_bytes);
     if (err != cudaSuccess) { 
         std::cerr << "Failed to allocate d_scalars: " << cudaGetErrorString(err) << std::endl; 
@@ -53,29 +52,31 @@ int perform_msm_on_gpu(void* result, const void* points, const void* scalars, si
         cudaFree(d_scalars);
         return 1; 
     }
-
+    
     // 2. Copy data from Host (CPU) to Device (GPU)
     err = cudaMemcpy(d_points, points, points_bytes, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) { 
         std::cerr << "Failed to copy points to device: " << cudaGetErrorString(err) << std::endl; 
-        cudaFree(d_points); cudaFree(d_scalars); cudaFree(d_result);
+        cudaFree(d_points); 
+        cudaFree(d_scalars); 
+        cudaFree(d_result);
         return 1; 
     }
-
+    
     err = cudaMemcpy(d_scalars, scalars, scalars_bytes, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) { 
         std::cerr << "Failed to copy scalars to device: " << cudaGetErrorString(err) << std::endl; 
-        cudaFree(d_points); cudaFree(d_scalars); cudaFree(d_result);
+        cudaFree(d_points); 
+        cudaFree(d_scalars); 
+        cudaFree(d_result);
         return 1; 
     }
-
+    
     // 3. Launch the CUDA Kernel
     int threads_per_block = 256;
     int blocks_per_grid = (num_points + threads_per_block - 1) / threads_per_block;
-
-    std::cout << "GPU MSM: Launching kernel with " << blocks_per_grid << " blocks, " 
-              << threads_per_block << " threads per block" << std::endl;
-
+    std::cout << "GPU MSM: Launching kernel with " << blocks_per_grid << " blocks, " << threads_per_block << " threads per block" << std::endl;
+    
     // For now, use a simple placeholder kernel
     msm_kernel<<<blocks_per_grid, threads_per_block>>>(
         (double*)d_result, (const double*)d_points, (const double*)d_scalars, num_points);
@@ -84,40 +85,46 @@ int perform_msm_on_gpu(void* result, const void* points, const void* scalars, si
     err = cudaGetLastError();
     if (err != cudaSuccess) { 
         std::cerr << "Kernel launch failed: " << cudaGetErrorString(err) << std::endl; 
-        cudaFree(d_points); cudaFree(d_scalars); cudaFree(d_result);
+        cudaFree(d_points); 
+        cudaFree(d_scalars); 
+        cudaFree(d_result);
         return 1; 
     }
-
+    
     // Wait for kernel to complete
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) { 
         std::cerr << "Kernel execution failed: " << cudaGetErrorString(err) << std::endl; 
-        cudaFree(d_points); cudaFree(d_scalars); cudaFree(d_result);
+        cudaFree(d_points); 
+        cudaFree(d_scalars); 
+        cudaFree(d_result);
         return 1; 
     }
-
+    
     // 4. Copy result from Device (GPU) back to Host (CPU)
     err = cudaMemcpy(result, d_result, result_bytes, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) { 
         std::cerr << "Failed to copy result to host: " << cudaGetErrorString(err) << std::endl; 
-        cudaFree(d_points); cudaFree(d_scalars); cudaFree(d_result);
+        cudaFree(d_points); 
+        cudaFree(d_scalars); 
+        cudaFree(d_result);
         return 1; 
     }
-
+    
     // 5. Free GPU memory
     cudaFree(d_points);
     cudaFree(d_scalars);
     cudaFree(d_result);
-
+    
     std::cout << "GPU MSM: Computation completed successfully" << std::endl;
     return 0;
 }
+
 }
 
 // Simple placeholder MSM kernel - this is where the real GPU magic would happen
 __global__ void msm_kernel(double* d_result, const double* d_points, const double* d_scalars, size_t num_points) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
     if (idx < num_points) {
         // Placeholder computation - in reality this would be complex elliptic curve operations
         // For now, just copy the input point scaled by a simple factor
