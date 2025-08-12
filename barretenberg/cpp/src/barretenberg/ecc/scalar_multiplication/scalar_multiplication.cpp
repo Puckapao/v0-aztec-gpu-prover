@@ -18,6 +18,12 @@
 #include "barretenberg/common/mem.hpp"
 #include "barretenberg/numeric/bitop/get_msb.hpp"
 
+#ifdef __NVCC__
+extern "C" {
+int perform_msm_on_gpu(void* result, const void* points, const void* scalars, size_t num_points);
+}
+#endif
+
 namespace bb::scalar_multiplication {
 
 /**
@@ -769,21 +775,44 @@ std::vector<typename Curve::AffineElement> MSM<Curve>::batch_multi_scalar_mul(
     if (use_gpu_env != nullptr && strcmp(use_gpu_env, "1") == 0) {
         std::cout << "\n\n--- GPU COMPUTATION TRIGGERED ---\n" << std::endl;
         
-    #ifdef __NVCC__
-        // CUDA is available - use GPU
-        std::vector<typename Curve::AffineElement> gpu_results(points.size());
-        
-        // Call our CUDA function (we'll create this)
-        if (perform_msm_on_gpu(gpu_results.data(), points.data(), scalars.data(), points.size()) == 0) {
-            std::cout << "--- GPU COMPUTATION SUCCESSFUL ---\n" << std::endl;
-            return gpu_results;
-        } else {
-            std::cout << "--- GPU COMPUTATION FAILED, FALLING BACK TO CPU ---\n" << std::endl;
+#ifdef __NVCC__
+        // CUDA is available - use GPU for the first MSM as a test
+        if (!points.empty() && !scalars.empty() && points[0].size() > 0) {
+            std::cout << "GPU MSM: Attempting GPU computation for " << points[0].size() << " points" << std::endl;
+            
+            // Create result vector for GPU computation
+            std::vector<typename Curve::AffineElement> gpu_results(points[0].size());
+            
+            // Call our CUDA function
+            int gpu_result = perform_msm_on_gpu(
+                gpu_results.data(), 
+                points[0].data(), 
+                scalars[0].data(), 
+                points[0].size()
+            );
+            
+            if (gpu_result == 0) {
+                std::cout << "--- GPU COMPUTATION SUCCESSFUL ---\n" << std::endl;
+                // For now, return the GPU result for the first MSM only
+                // TODO: Handle multiple MSMs on GPU
+                std::vector<typename Curve::AffineElement> final_results;
+                final_results.insert(final_results.end(), gpu_results.begin(), gpu_results.end());
+                
+                // Process remaining MSMs on CPU if there are multiple
+                if (points.size() > 1) {
+                    std::cout << "Processing remaining " << (points.size() - 1) << " MSMs on CPU" << std::endl;
+                    // Fall through to CPU computation for remaining MSMs
+                } else {
+                    return final_results;
+                }
+            } else {
+                std::cout << "--- GPU COMPUTATION FAILED, FALLING BACK TO CPU ---\n" << std::endl;
+            }
         }
-    #else
-        // CUDA not available - simulate GPU with faster CPU algorithm
+#else
+        // CUDA not available - use optimized CPU algorithm
         std::cout << "--- CUDA NOT AVAILABLE, USING OPTIMIZED CPU ---\n" << std::endl;
-    #endif
+#endif
     }
     // V0: GPU IMPLEMENTATION END
     ASSERT(points.size() == scalars.size());
