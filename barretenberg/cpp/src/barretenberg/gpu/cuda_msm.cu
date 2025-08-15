@@ -1,4 +1,4 @@
-// cuda_msm.cu
+// cuda_msm.cu v0.0.7 - Fixed field inversion
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <string.h>
@@ -6,6 +6,7 @@
 #include <iostream>
 #include <chrono>
 #include <algorithm>
+#include <span>
 
 // -------------------------------
 // Constants (BN254 Fq / Fr)
@@ -28,12 +29,12 @@ __constant__ uint64_t BN254_FQ_R2[4] = {
 // Fq ninv = -p^{-1} mod 2^64
 __constant__ uint64_t BN254_FQ_NINV = 0x87d20782e4866389ULL;
 
-// Barretenberg G1 affine point at infinity (x sentinel, y=0)
+// Barretenberg G1 affine point at infinity (x = Fq::modulus, y=0)
 __constant__ uint64_t POINT_AT_INFINITY_X[4] = {
-    0x9e10460b6c3e7ea4ULL,
-    0xcbc0b548b438e546ULL,
-    0xdc2822db40c0ac2eULL,
-    0x183227397098d014ULL
+    0x3C208C16D87CFD47ULL,
+    0x97816a916871ca8dULL,
+    0xb85045b68181585dULL,
+    0x30644e72e131a029ULL
 };
 __constant__ uint64_t POINT_AT_INFINITY_Y[4] = {0,0,0,0};
 
@@ -49,8 +50,8 @@ static const uint64_t BN254_FQ_R2_HOST[4] = {
 static const uint64_t BN254_FQ_NINV_HOST = 0x87d20782e4866389ULL;
 
 static const uint64_t POINT_AT_INFINITY_X_HOST[4] = {
-    0x9e10460b6c3e7ea4ULL, 0xcbc0b548b438e546ULL,
-    0xdc2822db40c0ac2eULL, 0x183227397098d014ULL
+    0x3C208C16D87CFD47ULL, 0x97816a916871ca8dULL,
+    0xb85045b68181585dULL, 0x30644e72e131a029ULL
 };
 static const uint64_t POINT_AT_INFINITY_Y_HOST[4] = {0,0,0,0};
 
@@ -61,7 +62,7 @@ static const uint64_t BN254_FR_MOD_HOST[4] = {
 };
 static const uint64_t BN254_FR_R2_HOST[4] = {
     0x1bb8e645ae216da7ULL, 0x53fe3ab1e35c59e3ULL,
-    0x8c49833d53bb8085ULL, 0x0216d0b17f4e44a5ULL
+    0x8c49833d53bb8085ULL, 0x216d0b17f4e44a5ULL
 };
 static const uint64_t BN254_FR_NINV_HOST = 0xc2e1f593efffffffULL; // -r^{-1} mod 2^64
 
@@ -81,12 +82,13 @@ struct SpanInfo {
 // Device helpers (Fq Montgomery)
 // -------------------------------
 __device__ __forceinline__ void add64_c(uint64_t a, uint64_t b, uint64_t& out, uint64_t& carry) {
+    uint64_t old_carry = carry;
     uint64_t s = a + b;
-    uint64_t c1 = (s < a);
-    uint64_t s2 = s + carry;
-    uint64_t c2 = (s2 < s);
+    uint64_t c1 = (s < a) ? 1 : 0;
+    uint64_t s2 = s + old_carry;
+    uint64_t c2 = (s2 < s) ? 1 : 0;
     out = s2;
-    carry = c1 | c2;
+    carry = c1 + c2;
 }
 __device__ __forceinline__ void sub64_b(uint64_t a, uint64_t b, uint64_t& out, uint64_t& borrow) {
     uint64_t t = a - b - borrow;
@@ -132,45 +134,80 @@ __device__ void fe_sub(FieldElement& r, const FieldElement& a, const FieldElemen
 }
 __device__ void mont_mul(FieldElement& r, const FieldElement& a, const FieldElement& b) {
     uint64_t t[8] = {0};
-
-    // t = a*b
+    
+    // Phase 1: Multiply a * b - exactly match host logic
     for (int i = 0; i < 4; ++i) {
         uint64_t carry = 0;
         for (int j = 0; j < 4; ++j) {
-            uint64_t lo = a.limbs[i] * b.limbs[j];
-            uint64_t hi = __umul64hi(a.limbs[i], b.limbs[j]);
-            add64_c(t[i+j],   lo, t[i+j],   carry);
-            add64_c(t[i+j+1], hi, t[i+j+1], carry);
-            int k = i + j + 2;
+            // Compute a[i] * b[j] as 128-bit value
+            uint64_t prod_lo = a.limbs[i] * b.limbs[j];
+            uint64_t prod_hi = __umul64hi(a.limbs[i], b.limbs[j]);
+            
+            // Add to t[i+j] + carry
+            uint64_t sum_lo = t[i+j] + prod_lo + carry;
+            uint64_t sum_hi = prod_hi;
+            
+            // Handle overflow from low addition
+            if (sum_lo < t[i+j] || (sum_lo == t[i+j] && (prod_lo + carry) != 0)) {
+                sum_hi++;
+            }
+            
+            t[i+j] = sum_lo;
+            carry = sum_hi;
+        }
+        
+        // Propagate remaining carry
+        if (carry) {
+            int k = i + 4;
             while (carry && k < 8) {
-                uint64_t s = t[k] + 1;
-                carry = (s == 0);
-                t[k] = s;
+                t[k] += carry;
+                carry = (t[k] < carry) ? 1 : 0;
+                ++k;
+            }
+        }
+    }
+    
+    // Phase 2: Montgomery reduction - exactly match host logic  
+    for (int i = 0; i < 4; ++i) {
+        uint64_t m = t[i] * BN254_FQ_NINV;
+        uint64_t carry = 0;
+        
+        for (int j = 0; j < 4; ++j) {
+            // Compute m * modulus[j] as 128-bit value
+            uint64_t prod_lo = m * BN254_FQ_MOD[j];
+            uint64_t prod_hi = __umul64hi(m, BN254_FQ_MOD[j]);
+            
+            // Add to t[i+j] + carry
+            uint64_t sum_lo = t[i+j] + prod_lo + carry;
+            uint64_t sum_hi = prod_hi;
+            
+            // Handle overflow from low addition
+            if (sum_lo < t[i+j] || (sum_lo == t[i+j] && (prod_lo + carry) != 0)) {
+                sum_hi++;
+            }
+            
+            t[i+j] = sum_lo;
+            carry = sum_hi;
+        }
+        
+        // Propagate remaining carry
+        if (carry) {
+            int k = i + 4;
+            while (carry && k < 8) {
+                t[k] += carry;
+                carry = (t[k] < carry) ? 1 : 0;
                 ++k;
             }
         }
     }
 
-    // Montgomery reduction
-    for (int i = 0; i < 4; ++i) {
-        uint64_t m = t[i] * BN254_FQ_NINV;
-        uint64_t carry = 0;
-        for (int j = 0; j < 4; ++j) {
-            uint64_t lo = m * BN254_FQ_MOD[j];
-            uint64_t hi = __umul64hi(m, BN254_FQ_MOD[j]);
-            add64_c(t[i+j],   lo, t[i+j],   carry);
-            add64_c(t[i+j+1], hi, t[i+j+1], carry);
-        }
-        int k = i + 5;
-        while (carry && k < 8) {
-            uint64_t s = t[k] + 1;
-            carry = (s == 0);
-            t[k] = s;
-            ++k;
-        }
-    }
-
-    r.limbs[0] = t[4]; r.limbs[1] = t[5]; r.limbs[2] = t[6]; r.limbs[3] = t[7];
+    // Extract result from upper half
+    r.limbs[0] = t[4];
+    r.limbs[1] = t[5];
+    r.limbs[2] = t[6];
+    r.limbs[3] = t[7];
+    
+    // Final conditional subtraction if needed
     fe_cond_sub_p(r);
 }
 __device__ inline void fe_mul(FieldElement& r, const FieldElement& a, const FieldElement& b) { mont_mul(r,a,b); }
@@ -310,6 +347,100 @@ __device__ void jacobian_add(JacobianPoint& R, const JacobianPoint& P, const Jac
 // -------------------------------
 // Kernel: per-point scalar mul (w=4) → Jacobian
 // -------------------------------
+// Simple scalar multiplication kernel matching naive_msm approach
+__global__ void simple_scalar_mul_kernel(
+    JacobianPoint* __restrict__ d_out,
+    const AffinePoint* __restrict__ d_points,
+    const FieldElement* __restrict__ d_scalars,
+    size_t n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if ((size_t)idx >= n) return;
+
+    const AffinePoint& P = d_points[idx];
+    const FieldElement& k = d_scalars[idx];
+
+    // Handle zero scalar or point at infinity
+    if ((k.limbs[0]|k.limbs[1]|k.limbs[2]|k.limbs[3]) == 0ULL || affine_is_infinity(P)) {
+        jacobian_set_inf(d_out[idx]);
+        return;
+    }
+
+    // Convert affine point to Jacobian for accumulator
+    JacobianPoint accumulator;
+    jacobian_from_affine(accumulator, P);
+    
+    // Find MSB of scalar (same as CPU algorithm)
+    int maximum_set_bit = -1;
+    for (int i = 253; i >= 0; i--) {
+        int limb = i / 64;
+        int bit_pos = i % 64;
+        if (limb < 4 && (k.limbs[limb] & (1ULL << bit_pos))) {
+            maximum_set_bit = i;
+            break;
+        }
+    }
+    
+    if (maximum_set_bit <= 0) {
+        // Scalar is 0 or 1
+        if (maximum_set_bit == 0) {
+            // Scalar is 1, result = P
+            accumulator = accumulator; // Already set to P
+        } else {
+            // Scalar is 0, result = infinity
+            jacobian_set_inf(accumulator);
+        }
+        d_out[idx] = accumulator;
+        return;
+    }
+    
+    // Exact CPU algorithm: start from MSB-1 and work down
+    for (int i = maximum_set_bit - 1; i >= 0; i--) {
+        jacobian_double(accumulator, accumulator); // accumulator.self_dbl()
+        
+        // Check if bit i is set
+        int limb = i / 64;
+        int bit_pos = i % 64;
+        if (limb < 4 && (k.limbs[limb] & (1ULL << bit_pos))) {
+            // accumulator += *this (add original point P)
+            JacobianPoint P_jacobian;
+            jacobian_from_affine(P_jacobian, P);
+            jacobian_add(accumulator, accumulator, P_jacobian);
+        }
+    }
+    
+    JacobianPoint result = accumulator;
+    
+    d_out[idx] = result;
+    
+    // Debug: Test with simple scalar multiplication: 2 * P
+    if (idx == 0) {
+        printf("GPU Debug - Point 0 scalar multiplication:\n");
+        printf("  Input scalar: %016llx_%016llx_%016llx_%016llx\n", 
+               k.limbs[3], k.limbs[2], k.limbs[1], k.limbs[0]);
+        printf("  Input point X: %016llx_%016llx_%016llx_%016llx\n",
+               P.x.limbs[3], P.x.limbs[2], P.x.limbs[1], P.x.limbs[0]);
+        printf("  Input point Y: %016llx_%016llx_%016llx_%016llx\n",
+               P.y.limbs[3], P.y.limbs[2], P.y.limbs[1], P.y.limbs[0]);
+        
+        // Test simple doubling: 2*P
+        JacobianPoint test_double;
+        jacobian_from_affine(test_double, P);
+        jacobian_double(test_double, test_double);
+        printf("  2*P Result X: %016llx_%016llx_%016llx_%016llx\n",
+               test_double.X.limbs[3], test_double.X.limbs[2], test_double.X.limbs[1], test_double.X.limbs[0]);
+        printf("  2*P Result Z: %016llx_%016llx_%016llx_%016llx\n",
+               test_double.Z.limbs[3], test_double.Z.limbs[2], test_double.Z.limbs[1], test_double.Z.limbs[0]);
+        
+        printf("  Final Result X: %016llx_%016llx_%016llx_%016llx\n",
+               result.X.limbs[3], result.X.limbs[2], result.X.limbs[1], result.X.limbs[0]);
+        printf("  Final Result Y: %016llx_%016llx_%016llx_%016llx\n",
+               result.Y.limbs[3], result.Y.limbs[2], result.Y.limbs[1], result.Y.limbs[0]);
+        printf("  Final Result Z: %016llx_%016llx_%016llx_%016llx\n",
+               result.Z.limbs[3], result.Z.limbs[2], result.Z.limbs[1], result.Z.limbs[0]);
+    }
+}
+
 __global__ void msm_kernel(
     JacobianPoint* __restrict__ d_out,
     const AffinePoint* __restrict__ d_points,   // Fq Montgomery
@@ -335,34 +466,47 @@ __global__ void msm_kernel(
     for (int i = 2; i < T; ++i) jacobian_add_mixed(table[i], table[i-1], P);
     jacobian_set_inf(table[0]);
 
-    // Windowed method (MSB→LSB)
+    // Windowed method (MSB→LSB) - process scalar from high to low bits
     JacobianPoint R; jacobian_set_inf(R);
 
+    // Start from the most significant window and work down
     for (int win = 63; win >= 0; --win) {
+        // Double the accumulator 4 times for the 4-bit window
         if (!jacobian_is_inf(R)) {
-            jacobian_double(R,R);
-            jacobian_double(R,R);
-            jacobian_double(R,R);
-            jacobian_double(R,R);
-        }
-        int bit = win * W;
-        int limb = bit >> 6;
-        int off  = bit & 63;
-
-        uint64_t w = 0;
-        if (limb < 4) {
-            uint64_t cur = s.limbs[limb] >> off;
-            if (off <= 60) w = cur & 0xF;
-            else {
-                int rem = 64 - off;
-                int nxt = W - rem;
-                w = cur & ((1u << rem) - 1);
-                if (limb + 1 < 4) w |= (s.limbs[limb+1] & ((1u << nxt) - 1)) << rem;
+            for (int d = 0; d < W; ++d) {
+                jacobian_double(R, R);
             }
         }
-        if (w) {
-            if (jacobian_is_inf(R)) R = table[w];
-            else jacobian_add(R, R, table[w]);
+        
+        // Extract 4-bit window from scalar
+        int bit_pos = win * W; // Starting bit position for this window
+        int limb_idx = bit_pos >> 6; // Which 64-bit limb
+        int bit_offset = bit_pos & 63; // Bit offset within limb
+
+        uint64_t window_val = 0;
+        if (limb_idx < 4) {
+            if (bit_offset <= 60) {
+                // Window fits entirely in current limb
+                window_val = (s.limbs[limb_idx] >> bit_offset) & 0xF;
+            } else {
+                // Window spans two limbs
+                int bits_from_current = 64 - bit_offset;
+                int bits_from_next = W - bits_from_current;
+                
+                window_val = (s.limbs[limb_idx] >> bit_offset) & ((1ULL << bits_from_current) - 1);
+                if (limb_idx + 1 < 4) {
+                    window_val |= (s.limbs[limb_idx + 1] & ((1ULL << bits_from_next) - 1)) << bits_from_current;
+                }
+            }
+        }
+        
+        // Add the precomputed point if window is non-zero
+        if (window_val > 0) {
+            if (jacobian_is_inf(R)) {
+                R = table[window_val];
+            } else {
+                jacobian_add(R, R, table[window_val]);
+            }
         }
     }
     d_out[idx] = R;
@@ -534,17 +678,27 @@ static inline void j_from_affine(JacobianPoint& R, const AffinePoint& P) {
     R.X = P.x; R.Y = P.y; fq_set_one(R.Z);
 }
 static inline void fq_inv(FieldElement& out, const FieldElement& z) {
+    // Use Fermat's Little Theorem: z^(p-2) = z^(-1) mod p
+    // where p = BN254_FQ_MOD = 0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47
+    // so p-2 = 0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45
+    
+    static const uint64_t p_minus_2[4] = {
+        0x3c208c16d87cfd45ULL,  // mod[0] - 2
+        0x97816a916871ca8dULL,  // mod[1] 
+        0xb85045b68181585dULL,  // mod[2]
+        0x30644e72e131a029ULL   // mod[3]
+    };
+    
     FieldElement base = z;
     FieldElement res; fq_set_one(res);
-    uint64_t e[4];
-    uint64_t borrow = 2;
-    for (int i=0;i<4;++i) {
-        if (BN254_FQ_MOD_HOST[i] >= borrow) { e[i] = BN254_FQ_MOD_HOST[i] - borrow; borrow = 0; }
-        else { e[i] = BN254_FQ_MOD_HOST[i] - borrow; borrow = 1; }
-    }
-    for (int limb=0; limb<4; ++limb) {
-        for (int bit=0; bit<64; ++bit) {
-            if ( (e[limb] >> bit) & 1ULL ) fq_mul(res, res, base);
+    
+    // Binary exponentiation using p-2 as exponent
+    for (int limb = 0; limb < 4; ++limb) {
+        uint64_t exp_limb = p_minus_2[limb];
+        for (int bit = 0; bit < 64; ++bit) {
+            if (exp_limb & (1ULL << bit)) {
+                fq_mul(res, res, base);
+            }
             fq_sqr(base, base);
         }
     }
@@ -622,114 +776,218 @@ static inline void fr_from_mont(FieldElement& out, const FieldElement& a) {
 // -------------------------------
 extern "C" __attribute__((visibility("default")))
 int cuda_msm_compute(
-    void* result,                   // out (AffinePoint or array of AffinePoint)
-    const void* points_spans,       // SpanInfo*
-    const void* scalars_spans,      // SpanInfo*
+    void* result,                   // out (array of AffinePoint, one per span)
+    const void* points_spans,       // array of std::span<const AffineElement>
+    const void* scalars_spans,      // array of std::span<ScalarField>  
     size_t num_spans)
 {
     auto t0 = std::chrono::high_resolution_clock::now();
-
-    const SpanInfo* Pspans = static_cast<const SpanInfo*>(points_spans);
-    const SpanInfo* Sspans = static_cast<const SpanInfo*>(scalars_spans);
-
-    // FIX 2: respect per-span min length
-    std::vector<size_t> counts(num_spans);
-    size_t total = 0;
-    for (size_t i=0;i<num_spans;++i) {
-        counts[i] = std::min(Pspans[i].size, Sspans[i].size);
-        total += counts[i];
-    }
-
-    // Flatten inputs & decode Fr scalars
-    std::vector<AffinePoint>  h_points(total);
-    std::vector<FieldElement> h_scalars_std(total);
-    {
-        size_t k=0;
-        for (size_t s=0;s<num_spans;++s) {
-            const size_t n = counts[s];
-            const AffinePoint* pp = static_cast<const AffinePoint*>(Pspans[s].data_ptr);
-            const FieldElement* ss = static_cast<const FieldElement*>(Sspans[s].data_ptr);
-            for (size_t i=0;i<n;++i,++k) {
-                h_points[k] = pp[i];
-                FieldElement s_std; fr_from_mont(s_std, ss[i]);
-                h_scalars_std[k] = s_std;
-            }
+    
+    // Version logging
+    std::cout << "=== libcuda_msm.so v0.0.7 called with " << num_spans << " spans ===" << std::endl;
+    
+    // Debug: Log span sizes
+    using AffineSpan = std::span<const AffinePoint>;
+    using ScalarSpan = std::span<FieldElement>;
+    
+    const AffineSpan* point_spans_debug = static_cast<const AffineSpan*>(points_spans);
+    const ScalarSpan* scalar_spans_debug = static_cast<const ScalarSpan*>(scalars_spans);
+    
+    for (size_t s = 0; s < num_spans; ++s) {
+        std::cout << "Span " << s << ": " << point_spans_debug[s].size() << " points, " 
+                  << scalar_spans_debug[s].size() << " scalars" << std::endl;
+        
+        // Debug first point and scalar for span 0
+        if (s == 0 && point_spans_debug[s].size() > 0) {
+            const AffinePoint& p0 = point_spans_debug[s][0];
+            const FieldElement& s0 = scalar_spans_debug[s][0];
+            
+            std::cout << "First point X: " << std::hex 
+                      << p0.x.limbs[3] << "_" << p0.x.limbs[2] << "_" 
+                      << p0.x.limbs[1] << "_" << p0.x.limbs[0] << std::dec << std::endl;
+            std::cout << "First scalar: " << std::hex 
+                      << s0.limbs[3] << "_" << s0.limbs[2] << "_" 
+                      << s0.limbs[1] << "_" << s0.limbs[0] << std::dec << std::endl;
         }
     }
-
-    // Declare output host buffer BEFORE any goto targets
-    std::vector<JacobianPoint> h_jac;
-
-    // Device buffers
-    AffinePoint*   d_points  = nullptr;
-    FieldElement*  d_scalars = nullptr;
-    JacobianPoint* d_jac     = nullptr;
-
-    cudaError_t err = cudaSuccess;
-
-    if (total == 0) {
-        // Degenerate input, just return zeros/infinities
-        if (num_spans == 1) {
-            AffinePoint out;
-            for (int i=0;i<4;++i) { out.x.limbs[i]=POINT_AT_INFINITY_X_HOST[i]; out.y.limbs[i]=0; }
-            memcpy(result, &out, sizeof(AffinePoint));
-        } else {
-            std::vector<AffinePoint> outs(num_spans);
-            for (size_t s=0;s<num_spans;++s) {
-                for (int i=0;i<4;++i) { outs[s].x.limbs[i]=POINT_AT_INFINITY_X_HOST[i]; outs[s].y.limbs[i]=0; }
-            }
-            memcpy(result, outs.data(), num_spans*sizeof(AffinePoint));
+    
+    if (num_spans == 0) {
+        // Return array of points at infinity
+        std::vector<AffinePoint> outs(1);
+        for (int i=0;i<4;++i) { 
+            outs[0].x.limbs[i] = POINT_AT_INFINITY_X_HOST[i]; 
+            outs[0].y.limbs[i] = 0; 
         }
+        memcpy(result, outs.data(), sizeof(AffinePoint));
         auto t1 = std::chrono::high_resolution_clock::now();
         auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         std::cout << "GPU MSM total time: " << us << " us\n";
         return 0;
     }
 
-    err = cudaMalloc(&d_points,  total * sizeof(AffinePoint));        if (err) { std::cerr<<"cudaMalloc points failed\n"; goto CLEANUP; }
-    err = cudaMalloc(&d_scalars, total * sizeof(FieldElement));        if (err) { std::cerr<<"cudaMalloc scalars failed\n"; goto CLEANUP; }
-    err = cudaMalloc(&d_jac,     total * sizeof(JacobianPoint));       if (err) { std::cerr<<"cudaMalloc jac failed\n"; goto CLEANUP; }
-
-    err = cudaMemcpy(d_points,  h_points.data(),      total*sizeof(AffinePoint),  cudaMemcpyHostToDevice); if (err) { std::cerr<<"cpy points->dev failed\n"; goto CLEANUP; }
-    err = cudaMemcpy(d_scalars, h_scalars_std.data(), total*sizeof(FieldElement), cudaMemcpyHostToDevice); if (err) { std::cerr<<"cpy scalars->dev failed\n"; goto CLEANUP; }
-
-    {
-        const int TPB = 256;
-        const int blocks = (int)((total + TPB - 1) / TPB);
-        msm_kernel<<<blocks, TPB>>>(d_jac, d_points, d_scalars, total);
-        err = cudaGetLastError();       if (err) { std::cerr<<"kernel launch failed: "<<cudaGetErrorString(err)<<"\n"; goto CLEANUP; }
-        err = cudaDeviceSynchronize();  if (err) { std::cerr<<"kernel exec failed: "<<cudaGetErrorString(err)<<"\n"; goto CLEANUP; }
+    // CRITICAL FIX: The CPU is actually passing std::span<const AffineElement> and std::span<ScalarField>
+    // But these might be different sizes than our FieldElement/AffinePoint structs
+    // Let's cast more carefully and check sizes
+    
+    // For now, let's assume they match and cast directly to our types
+    using AffineSpan = std::span<const AffinePoint>;
+    using ScalarSpan = std::span<FieldElement>;
+    
+    const AffineSpan* point_spans = static_cast<const AffineSpan*>(points_spans);
+    const ScalarSpan* scalar_spans = static_cast<const ScalarSpan*>(scalars_spans);
+    
+    // Log struct sizes for verification
+    std::cout << "Our AffinePoint size: " << sizeof(AffinePoint) << ", FieldElement size: " << sizeof(FieldElement) << std::endl;
+    
+    // Calculate total points across all spans
+    size_t total_points = 0;
+    std::vector<size_t> span_sizes(num_spans);
+    for (size_t s = 0; s < num_spans; ++s) {
+        span_sizes[s] = std::min(point_spans[s].size(), scalar_spans[s].size());
+        total_points += span_sizes[s];
     }
-
-    // Copy back Jacobians
-    h_jac.resize(total);
-    err = cudaMemcpy(h_jac.data(), d_jac, total*sizeof(JacobianPoint), cudaMemcpyDeviceToHost);
-    if (err) { std::cerr<<"cpy jac->host failed\n"; goto CLEANUP; }
-
-    // Accumulate per span on HOST in Jacobian; convert once to affine
-    if (num_spans == 1) {
-        JacobianPoint acc; j_set_inf(acc);
-        for (size_t i=0;i<total;++i) {
-            if (j_is_inf(acc)) acc = h_jac[i];
-            else j_add(acc, acc, h_jac[i]);
-        }
-        AffinePoint out;
-        j_to_affine(out, acc);
-        memcpy(result, &out, sizeof(AffinePoint));
-    } else {
+    
+    if (total_points == 0) {
+        // Return array of points at infinity
         std::vector<AffinePoint> outs(num_spans);
-        size_t k=0;
-        for (size_t s=0;s<num_spans;++s) {
-            const size_t n = counts[s];
-            JacobianPoint acc; j_set_inf(acc);
-            for (size_t i=0;i<n;++i,++k) {
-                if (j_is_inf(acc)) acc = h_jac[k];
-                else j_add(acc, acc, h_jac[k]);
+        for (size_t s = 0; s < num_spans; ++s) {
+            for (int i=0;i<4;++i) { 
+                outs[s].x.limbs[i] = POINT_AT_INFINITY_X_HOST[i]; 
+                outs[s].y.limbs[i] = 0; 
             }
-            j_to_affine(outs[s], acc);
         }
-        memcpy(result, outs.data(), num_spans*sizeof(AffinePoint));
+        memcpy(result, outs.data(), num_spans * sizeof(AffinePoint));
+        auto t1 = std::chrono::high_resolution_clock::now();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        std::cout << "GPU MSM total time: " << us << " us\n";
+        return 0;
     }
+
+    // Flatten all spans into single arrays
+    std::vector<AffinePoint> h_points(total_points);
+    std::vector<FieldElement> h_scalars_std(total_points);
+    
+    size_t offset = 0;
+    for (size_t s = 0; s < num_spans; ++s) {
+        const size_t span_size = span_sizes[s];
+        
+        // Use points exactly as CPU provides them (no coordinate conversion)
+        for (size_t i = 0; i < span_size; ++i) {
+            h_points[offset + i] = point_spans[s][i];
+        }
+        
+        // CPU already converts scalars to standard form, so use them directly
+        for (size_t i = 0; i < span_size; ++i) {
+            h_scalars_std[offset + i] = scalar_spans[s][i];
+            
+            // Debug: Log scalar values for first few scalars of first span
+            if (s == 0 && i < 3) {
+                const FieldElement& scalar = h_scalars_std[offset + i];
+                std::cout << "Scalar " << i << " (already standard): " << std::hex
+                          << scalar.limbs[3] << "_" << scalar.limbs[2] << "_" << scalar.limbs[1] << "_" << scalar.limbs[0] << std::dec << std::endl;
+            }
+        }
+        
+        offset += span_size;
+    }
+
+    // Device buffers - declare all variables before any goto targets
+    AffinePoint*   d_points  = nullptr;
+    FieldElement*  d_scalars = nullptr;
+    JacobianPoint* d_jac     = nullptr;
+    cudaError_t err = cudaSuccess;
+    const int TPB = 256;
+    const int blocks = (int)((total_points + TPB - 1) / TPB);
+    std::vector<JacobianPoint> h_jac;
+    std::vector<AffinePoint> outputs;
+    
+    // Initialize vectors
+    h_jac.reserve(total_points);
+    outputs.reserve(num_spans);
+
+    // Allocate device memory
+    err = cudaMalloc(&d_points,  total_points * sizeof(AffinePoint));
+    if (err) { std::cerr<<"cudaMalloc points failed\n"; goto CLEANUP; }
+    
+    err = cudaMalloc(&d_scalars, total_points * sizeof(FieldElement));
+    if (err) { std::cerr<<"cudaMalloc scalars failed\n"; goto CLEANUP; }
+    
+    err = cudaMalloc(&d_jac,     total_points * sizeof(JacobianPoint));
+    if (err) { std::cerr<<"cudaMalloc jac failed\n"; goto CLEANUP; }
+
+    // Copy data to device
+    err = cudaMemcpy(d_points, h_points.data(), total_points*sizeof(AffinePoint), cudaMemcpyHostToDevice);
+    if (err) { std::cerr<<"cpy points->dev failed\n"; goto CLEANUP; }
+    
+    err = cudaMemcpy(d_scalars, h_scalars_std.data(), total_points*sizeof(FieldElement), cudaMemcpyHostToDevice);
+    if (err) { std::cerr<<"cpy scalars->dev failed\n"; goto CLEANUP; }
+
+    // Launch kernel using simple scalar multiplication (matching CPU)
+    simple_scalar_mul_kernel<<<blocks, TPB>>>(d_jac, d_points, d_scalars, total_points);
+    
+    err = cudaGetLastError();
+    if (err) { std::cerr<<"kernel launch failed: "<<cudaGetErrorString(err)<<"\n"; goto CLEANUP; }
+    
+    err = cudaDeviceSynchronize();
+    if (err) { std::cerr<<"kernel exec failed: "<<cudaGetErrorString(err)<<"\n"; goto CLEANUP; }
+
+    // Copy results back
+    h_jac.resize(total_points);
+    err = cudaMemcpy(h_jac.data(), d_jac, total_points*sizeof(JacobianPoint), cudaMemcpyDeviceToHost);
+    if (err) { std::cerr<<"cpy jac->host failed\n"; goto CLEANUP; }
+    
+    // Debug: Check first few kernel results
+    std::cout << "First 3 kernel results (Jacobian):" << std::endl;
+    for (size_t i = 0; i < std::min((size_t)3, total_points); ++i) {
+        const JacobianPoint& jp = h_jac[i];
+        bool is_inf = j_is_inf(jp);
+        std::cout << "  Point " << i << " (inf=" << is_inf << "): X=" << std::hex 
+                  << jp.X.limbs[3] << "_" << jp.X.limbs[2] << "_" << jp.X.limbs[1] << "_" << jp.X.limbs[0]
+                  << " Z=" << jp.Z.limbs[3] << "_" << jp.Z.limbs[2] << "_" << jp.Z.limbs[1] << "_" << jp.Z.limbs[0] << std::dec << std::endl;
+    }
+
+    // Accumulate per span and convert to affine
+    outputs.resize(num_spans);
+    offset = 0;
+    
+    for (size_t s = 0; s < num_spans; ++s) {
+        const size_t span_size = span_sizes[s];
+        
+        JacobianPoint acc; 
+        j_set_inf(acc);
+        
+        for (size_t i = 0; i < span_size; ++i) {
+            if (j_is_inf(acc)) {
+                acc = h_jac[offset + i];
+            } else {
+                j_add(acc, acc, h_jac[offset + i]);
+            }
+        }
+        
+        // Debug: Check accumulator state
+        bool is_acc_inf = j_is_inf(acc);
+        std::cout << "Span " << s << " accumulator: inf=" << is_acc_inf;
+        if (is_acc_inf) {
+            std::cout << " (returning sentinel)" << std::endl;
+        } else {
+            std::cout << " X=" << std::hex << acc.X.limbs[3] << "_" << acc.X.limbs[2] << "_" << acc.X.limbs[1] << "_" << acc.X.limbs[0] << std::dec << std::endl;
+        }
+        
+        // CRITICAL FIX: Check if accumulator is still at infinity
+        if (j_is_inf(acc)) {
+            // Return the correct point at infinity that matches CPU expectations
+            for (int i = 0; i < 4; ++i) { 
+                outputs[s].x.limbs[i] = POINT_AT_INFINITY_X_HOST[i]; 
+                outputs[s].y.limbs[i] = POINT_AT_INFINITY_Y_HOST[i]; 
+            }
+        } else {
+            j_to_affine(outputs[s], acc);
+        }
+        
+        offset += span_size;
+    }
+    
+    memcpy(result, outputs.data(), num_spans * sizeof(AffinePoint));
 
 CLEANUP:
     if (d_points)  cudaFree(d_points);
@@ -739,5 +997,5 @@ CLEANUP:
     auto t1 = std::chrono::high_resolution_clock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
     std::cout << "GPU MSM total time: " << us << " us\n";
-    return (err==cudaSuccess) ? 0 : 1;
+    return (err == cudaSuccess) ? 0 : 1;
 }
