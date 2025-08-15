@@ -18,11 +18,8 @@
 #include "barretenberg/common/mem.hpp"
 #include "barretenberg/numeric/bitop/get_msb.hpp"
 
-#ifdef __NVCC__
-extern "C" {
-int perform_msm_on_gpu(void* result, const void* points, const void* scalars, size_t num_points);
-}
-#endif
+#include <dlfcn.h>
+#include <cstring>
 
 namespace bb::scalar_multiplication {
 
@@ -764,6 +761,7 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
  * @param scalars
  * @return std::vector<typename Curve::AffineElement>
  */
+
 template <typename Curve>
 std::vector<typename Curve::AffineElement> MSM<Curve>::batch_multi_scalar_mul(
     std::vector<std::span<const typename Curve::AffineElement>>& points,
@@ -773,50 +771,65 @@ std::vector<typename Curve::AffineElement> MSM<Curve>::batch_multi_scalar_mul(
     // V0: GPU IMPLEMENTATION START
     const char* use_gpu_env = std::getenv("USE_GPU_PLACEHOLDER");
     if (use_gpu_env != nullptr && strcmp(use_gpu_env, "1") == 0) {
-        std::cout << "\n\n--- GPU COMPUTATION TRIGGERED ---\n" << std::endl;
+        // std::cout << "\n\n--- GPU COMPUTATION TRIGGERED ---\n" << std::endl;
         
-#ifdef __NVCC__
-        // CUDA is available - use GPU for the first MSM as a test
-        if (!points.empty() && !scalars.empty() && points[0].size() > 0) {
-            std::cout << "GPU MSM: Attempting GPU computation for " << points[0].size() << " points" << std::endl;
+        void* cuda_msm_lib = dlopen("./libcuda_msm.so", RTLD_LAZY);
+        if (!cuda_msm_lib) {
+            cuda_msm_lib = dlopen("/home/puckapao/libcuda_msm.so", RTLD_LAZY);
+        }
+        if (!cuda_msm_lib) {
+            cuda_msm_lib = dlopen("../../gpu/libcuda_msm.so", RTLD_LAZY);
+        }
+        if (!cuda_msm_lib) {
+            cuda_msm_lib = dlopen("/root/aztec-packages/barretenberg/cpp/src/barretenberg/gpu/libcuda_msm.so", RTLD_LAZY);
+        }
+        
+        if (cuda_msm_lib) {
+            // std::cout << "--- CUDA LIBRARY FOUND, LOADING GPU FUNCTION ---\n" << std::endl;
             
-            // Create result vector for GPU computation
-            std::vector<typename Curve::AffineElement> gpu_results(points[0].size());
+            // Get the CUDA MSM function
+            typedef int (*cuda_msm_compute_t)(void*, const void*, const void*, size_t);
+            cuda_msm_compute_t cuda_msm_compute = 
+                (cuda_msm_compute_t)dlsym(cuda_msm_lib, "cuda_msm_compute");
             
-            // Call our CUDA function
-            int gpu_result = perform_msm_on_gpu(
-                gpu_results.data(), 
-                points[0].data(), 
-                scalars[0].data(), 
-                points[0].size()
-            );
-            
-            if (gpu_result == 0) {
-                std::cout << "--- GPU COMPUTATION SUCCESSFUL ---\n" << std::endl;
-                // For now, return the GPU result for the first MSM only
-                // TODO: Handle multiple MSMs on GPU
-                std::vector<typename Curve::AffineElement> final_results;
-                final_results.insert(final_results.end(), gpu_results.begin(), gpu_results.end());
+            if (cuda_msm_compute) {
+                std::cout << "--- CALLING GPU FUNCTION ---\n" << std::endl;
                 
-                // Process remaining MSMs on CPU if there are multiple
-                if (points.size() > 1) {
-                    std::cout << "Processing remaining " << (points.size() - 1) << " MSMs on CPU" << std::endl;
-                    // Fall through to CPU computation for remaining MSMs
+                std::vector<typename Curve::AffineElement> gpu_results(points.size());
+                
+                // Call the dynamically loaded CUDA function
+                if (cuda_msm_compute(gpu_results.data(), points.data(), scalars.data(), points.size()) == 0) {
+                    std::cout << "--- GPU COMPUTATION SUCCESSFUL ---\n" << std::endl;
+                    dlclose(cuda_msm_lib);
+                    return gpu_results;
                 } else {
-                    return final_results;
+                    std::cout << "--- GPU COMPUTATION FAILED, FALLING BACK TO CPU ---\n" << std::endl;
                 }
             } else {
-                std::cout << "--- GPU COMPUTATION FAILED, FALLING BACK TO CPU ---\n" << std::endl;
+                std::cout << "--- GPU FUNCTION NOT FOUND IN LIBRARY ---\n" << std::endl;
             }
+            dlclose(cuda_msm_lib);
+        } else {
+            std::cout << "--- CUDA LIBRARY NOT FOUND ---\n" << std::endl;
+            std::cout << "--- TO ENABLE GPU: cd gpu && make ---\n" << std::endl;
         }
-#else
-        // CUDA not available - use optimized CPU algorithm
-        std::cout << "--- CUDA NOT AVAILABLE, USING OPTIMIZED CPU ---\n" << std::endl;
-#endif
     }
+    
     // V0: GPU IMPLEMENTATION END
     ASSERT(points.size() == scalars.size());
     const size_t num_msms = points.size();
+
+    // Placeholder CPU implementation - compute sum of all scalar multiplications
+    typename Curve::AffineElement result = Curve::AffineElement::infinity();
+    
+    for (size_t i = 0; i < points.size(); ++i) {
+        for (size_t j = 0; j < points[i].size(); ++j) {
+            result = result + (points[i][j] * scalars[i][j]);
+        }
+    }
+    
+    // Return single result as vector for compatibility
+    return std::vector<typename Curve::AffineElement>{result};
 
     std::vector<std::vector<uint32_t>> msm_scalar_indices;
     std::vector<ThreadWorkUnits> thread_work_units = get_work_units(scalars, msm_scalar_indices);

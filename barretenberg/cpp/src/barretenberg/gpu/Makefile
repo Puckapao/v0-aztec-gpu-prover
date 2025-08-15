@@ -1,6 +1,6 @@
 # Separate Makefile to compile CUDA library
 NVCC = nvcc
-CUDA_FLAGS = -shared -Xcompiler -fPIC -O3
+CUDA_FLAGS = -shared -Xcompiler -fPIC -O3 -arch=sm_61
 
 libcuda_msm.so: cuda_msm.cu
 	$(NVCC) $(CUDA_FLAGS) -o libcuda_msm.so cuda_msm.cu
