@@ -18,41 +18,7 @@
 #include "barretenberg/common/mem.hpp"
 #include "barretenberg/numeric/bitop/get_msb.hpp"
 
-// GPU acceleration function declarations
-extern "C" int gpu_accelerated_add_affine_points(void* points, size_t num_points, void* scratch_space);
-extern "C" int gpu_test_affine_acceleration();
-
 #include <dlfcn.h>
-#include <cstring>
-
-// GPU acceleration library management
-static void* gpu_acceleration_lib = nullptr;
-static bool gpu_lib_load_attempted = false;
-
-static void ensure_gpu_lib_loaded() {
-    if (gpu_lib_load_attempted) return;
-    gpu_lib_load_attempted = true;
-    
-    // Try to load the GPU acceleration library
-    const char* gpu_lib_names[] = {
-        "./libgpu_affine_acceleration.so",
-        "../gpu/libgpu_affine_acceleration.so", 
-        "../../libgpu_affine_acceleration.so",
-        "/home/puckapao/libgpu_affine_acceleration.so"
-    };
-    
-    for (const char* lib_name : gpu_lib_names) {
-        gpu_acceleration_lib = dlopen(lib_name, RTLD_LAZY);
-        if (gpu_acceleration_lib) {
-            std::cout << "HYBRID: Loaded GPU acceleration library: " << lib_name << std::endl;
-            break;
-        }
-    }
-    
-    if (!gpu_acceleration_lib) {
-        std::cout << "HYBRID: GPU acceleration library not found, using CPU only" << std::endl;
-    }
-}
 
 namespace bb::scalar_multiplication {
 
@@ -366,48 +332,6 @@ void MSM<Curve>::add_affine_points(typename Curve::AffineElement* points,
 {
     using Fq = typename Curve::BaseField;
     
-    // GPU acceleration threshold - use GPU for large batches
-    const size_t GPU_ACCELERATION_THRESHOLD = 512;
-    static bool gpu_available = true; // Cache GPU availability
-    
-    if (num_points >= GPU_ACCELERATION_THRESHOLD && gpu_available) {
-        std::cout << "HYBRID: Using GPU acceleration for add_affine_points with " << num_points << " points" << std::endl;
-        
-        // Ensure GPU library is loaded
-        ensure_gpu_lib_loaded();
-        
-        int gpu_result = -1;
-        if (gpu_acceleration_lib) {
-            // Get function pointer from GPU library
-            typedef int (*gpu_add_affine_points_fn)(void*, size_t, void*);
-            gpu_add_affine_points_fn gpu_fn = (gpu_add_affine_points_fn)dlsym(
-                gpu_acceleration_lib, "gpu_accelerated_add_affine_points"
-            );
-            
-            if (gpu_fn) {
-                // Try GPU acceleration
-                gpu_result = gpu_fn(
-                    static_cast<void*>(points),
-                    num_points,
-                    static_cast<void*>(scratch_space)
-                );
-            } else {
-                std::cout << "HYBRID: GPU function not found in library" << std::endl;
-            }
-        }
-        
-        if (gpu_result == 0) {
-            std::cout << "HYBRID: GPU acceleration successful!" << std::endl;
-            // GPU completed the parallel part successfully
-            // We may still need CPU for the batch inversion part
-            // For now, let the rest of the function handle batch inversion
-        } else {
-            std::cout << "HYBRID: GPU acceleration failed, falling back to CPU" << std::endl;
-            gpu_available = false; // Disable GPU for future calls in this session
-        }
-    } else if (num_points >= GPU_ACCELERATION_THRESHOLD) {
-        std::cout << "HYBRID: GPU disabled, using CPU for " << num_points << " points" << std::endl;
-    }
     
     Fq batch_inversion_accumulator = Fq::one();
 
@@ -498,10 +422,11 @@ typename Curve::Element MSM<Curve>::pippenger_low_memory_with_transformed_scalar
     Element round_output = Curve::Group::point_at_infinity;
 
     const size_t num_rounds = numeric::ceil_div(NUM_BITS_IN_FIELD, bits_per_slice);
+    
     for (size_t i = 0; i < num_rounds; ++i) {
         round_output = evaluate_pippenger_round(msm_data, i, affine_data, bucket_data, round_output, bits_per_slice);
     }
-
+    
     return (round_output);
 }
 
@@ -607,7 +532,9 @@ typename Curve::Element MSM<Curve>::evaluate_pippenger_round(MSMData& msm_data,
         std::span<uint64_t> point_schedule(&round_schedule[num_zero_entries], round_size);
         // Iterate through our point schedule and add points into corresponding buckets
         consume_point_schedule(point_schedule, points, affine_data, bucket_data, 0, 0);
+        
         round_output = accumulate_buckets(bucket_data);
+        
         bucket_data.bucket_exists.clear();
     }
 
@@ -621,6 +548,7 @@ typename Curve::Element MSM<Curve>::evaluate_pippenger_round(MSMData& msm_data,
     }
 
     result += round_output;
+    
     return result;
 }
 
@@ -644,6 +572,42 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
                                         size_t num_input_points_processed,
                                         size_t num_queued_affine_points) noexcept
 {
+    auto consume_start = std::chrono::high_resolution_clock::now();
+    std::cout << "\n=== CONSUME_POINT_SCHEDULE DETAILED LOG ===" << std::endl;
+    std::cout << "INPUT: processing " << point_schedule.size() << " points" << std::endl;
+    std::cout << "INPUT: num_input_points_processed=" << num_input_points_processed << std::endl;
+    std::cout << "INPUT: num_queued_affine_points=" << num_queued_affine_points << std::endl;
+    
+    // GPU Library Test - Step 2: Basic library loading and function call test
+    std::cout << "\n--- GPU LIBRARY TEST ---" << std::endl;
+    void* gpu_lib = dlopen("./libgpu_consume_point_schedule.so", RTLD_LAZY);
+    if (!gpu_lib) {
+        gpu_lib = dlopen("../gpu/libgpu_consume_point_schedule.so", RTLD_LAZY);
+    }
+    if (!gpu_lib) {
+        gpu_lib = dlopen("../../libgpu_consume_point_schedule.so", RTLD_LAZY);
+    }
+    
+    if (gpu_lib) {
+        std::cout << "GPU: Library loaded successfully!" << std::endl;
+        
+        // Try to get a test function
+        typedef int (*gpu_test_fn)();
+        gpu_test_fn test_fn = (gpu_test_fn)dlsym(gpu_lib, "gpu_test_function");
+        
+        if (test_fn) {
+            int result = test_fn();
+            std::cout << "GPU: Test function called, result=" << result << std::endl;
+        } else {
+            std::cout << "GPU: Test function not found in library" << std::endl;
+        }
+        
+        dlclose(gpu_lib);
+    } else {
+        std::cout << "GPU: Library not found, continuing with CPU only" << std::endl;
+        std::cout << "GPU: dlerror=" << dlerror() << std::endl;
+    }
+    std::cout << "--- END GPU LIBRARY TEST ---\n" << std::endl;
 
     size_t point_it = num_input_points_processed;
     size_t affine_input_it = num_queued_affine_points;
@@ -657,6 +621,22 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
     auto& scalar_scratch_space = affine_data.scalar_scratch_space;
     auto& output_point_schedule = affine_data.addition_result_bucket_destinations;
     AffineElement null_location{};
+    
+    std::cout << "INIT: num_points=" << num_points << std::endl;
+    std::cout << "INIT: bucket_accumulators.size()=" << bucket_accumulators.size() << std::endl;
+    std::cout << "INIT: affine_addition_scratch_space.size()=" << affine_addition_scratch_space.size() << std::endl;
+    std::cout << "INIT: AffineAdditionData::BATCH_SIZE=" << AffineAdditionData::BATCH_SIZE << std::endl;
+    
+    // Log first few point_schedule entries
+    std::cout << "POINT_SCHEDULE[0-2]: ";
+    for (size_t i = 0; i < std::min((size_t)3, num_points); i++) {
+        uint64_t schedule = point_schedule[i];
+        size_t bucket = static_cast<size_t>(schedule) & 0xFFFFFFFF;
+        size_t point = static_cast<size_t>(schedule >> 32);
+        std::cout << "[bucket=" << bucket << ",point=" << point << "] ";
+    }
+    std::cout << std::endl;
+    
     // We do memory prefetching, `prefetch_max` ensures we do not overflow our containers
     size_t prefetch_max = (num_points - 32);
     if (num_points < 32) {
@@ -666,8 +646,14 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
     if (num_points == 0) {
         end = 0;
     }
+    
+    std::cout << "BOUNDS: prefetch_max=" << prefetch_max << ", end=" << end << std::endl;
 
     // Step 1: Fill up `affine_addition_scratch_space` with up to AffineAdditionData::BATCH_SIZE/2 independent additions
+    std::cout << "\nSTEP1: Starting main processing loop" << std::endl;
+    std::cout << "LOOP_INIT: affine_input_it=" << affine_input_it << ", point_it=" << point_it << ", end=" << end << std::endl;
+    
+    size_t loop_iteration = 0;
     while (((affine_input_it + 1) < AffineAdditionData::BATCH_SIZE) && (point_it < end)) {
 
         // we prefetchin'
@@ -699,6 +685,23 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
         bool has_bucket_accumulator = bucket_accumulator_exists.get(lhs_bucket);
         bool buckets_match = lhs_bucket == rhs_bucket;
         bool do_affine_add = buckets_match || has_bucket_accumulator;
+        
+        // Log first few iterations
+        if (loop_iteration < 3) {
+            std::cout << "ITER[" << loop_iteration << "]: point_it=" << point_it << " affine_input_it=" << affine_input_it << std::endl;
+            std::cout << "  lhs_bucket=" << lhs_bucket << " rhs_bucket=" << rhs_bucket << std::endl;
+            std::cout << "  lhs_point=" << lhs_point << " rhs_point=" << rhs_point << std::endl;
+            std::cout << "  has_bucket_acc=" << has_bucket_accumulator << " buckets_match=" << buckets_match << " do_affine_add=" << do_affine_add << std::endl;
+            std::cout << "  lhs_point.x=" << std::hex << points[lhs_point].x << std::dec << std::endl;
+            std::cout << "  lhs_point.y=" << std::hex << points[lhs_point].y << std::dec << std::endl;
+            if (buckets_match) {
+                std::cout << "  rhs_point.x=" << std::hex << points[rhs_point].x << std::dec << std::endl;
+                std::cout << "  rhs_point.y=" << std::hex << points[rhs_point].y << std::dec << std::endl;
+            } else if (has_bucket_accumulator) {
+                std::cout << "  bucket_acc.x=" << std::hex << bucket_accumulators[lhs_bucket].x << std::dec << std::endl;
+                std::cout << "  bucket_acc.y=" << std::hex << bucket_accumulators[lhs_bucket].y << std::dec << std::endl;
+            }
+        }
 
         const AffineElement* lhs_source = &points[lhs_point];
         const AffineElement* rhs_source = buckets_match ? &points[rhs_point] : &bucket_accumulators[lhs_bucket];
@@ -726,6 +729,12 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
 
         affine_input_it += do_affine_add ? 2 : 0;
         point_it += (do_affine_add && buckets_match) ? 2 : 1;
+        
+        // Log first few iterations results
+        if (loop_iteration < 3) {
+            std::cout << "  RESULT: affine_input_it=" << affine_input_it << " point_it=" << point_it << std::endl;
+        }
+        loop_iteration++;
     }
     // We have to handle the last point as an edge case so that we dont overflow the bounds of `point_schedule`. If the
     // bucket accumulator exists, we add the point to it, otherwise the point simply becomes the bucket accumulator.
@@ -749,12 +758,28 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
             point_it += 1;
         }
     }
+    
+    std::cout << "\nSTEP1_COMPLETE: Main loop finished" << std::endl;
+    std::cout << "FINAL_STATE: point_it=" << point_it << " affine_input_it=" << affine_input_it << " total_iterations=" << loop_iteration << std::endl;
 
     // Now that we have populated `affine_addition_scratch_space`,
     // compute `num_affine_points_to_add` independent additions using the Affine trick
     size_t num_affine_points_to_add = affine_input_it;
+    std::cout << "\nSTEP2: About to call add_affine_points with " << num_affine_points_to_add << " points" << std::endl;
+    
+    // Log first few points that will be added
+    std::cout << "AFFINE_INPUT[0-2]: ";
+    for (size_t i = 0; i < std::min((size_t)6, num_affine_points_to_add); i += 2) {
+        std::cout << "[(" << std::hex << affine_addition_scratch_space[i].x << "," << affine_addition_scratch_space[i].y 
+                  << ")+(" << affine_addition_scratch_space[i+1].x << "," << affine_addition_scratch_space[i+1].y << std::dec << ")] ";
+    }
+    std::cout << std::endl;
     if (num_affine_points_to_add >= 2) {
+        auto affine_start = std::chrono::high_resolution_clock::now();
         add_affine_points(&affine_addition_scratch_space[0], num_affine_points_to_add, &scalar_scratch_space[0]);
+        auto affine_end = std::chrono::high_resolution_clock::now();
+        auto affine_duration = std::chrono::duration_cast<std::chrono::microseconds>(affine_end - affine_start);
+        std::cout << "CPU: add_affine_points call took " << affine_duration.count() << " microseconds" << std::endl;
     }
     // `add_affine_points` stores the result in the top-half of the used scratch space
     G1* affine_output = &affine_addition_scratch_space[0] + (num_affine_points_to_add / 2);
@@ -823,6 +848,10 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
     if (point_it < num_points || new_scratch_space_it != 0) {
         consume_point_schedule(point_schedule, points, affine_data, bucket_data, point_it, new_scratch_space_it);
     }
+    
+    auto consume_end = std::chrono::high_resolution_clock::now();
+    auto consume_duration = std::chrono::duration_cast<std::chrono::microseconds>(consume_end - consume_start);
+    std::cout << "CPU: consume_point_schedule completed in " << consume_duration.count() << " microseconds" << std::endl;
 }
 
 /**
@@ -845,114 +874,35 @@ std::vector<typename Curve::AffineElement> MSM<Curve>::batch_multi_scalar_mul(
     std::vector<std::span<ScalarField>>& scalars,
     bool handle_edge_cases) noexcept
 {
-    // // GPU PIPPENGER COMPARISON
-    // const char* use_gpu_env = std::getenv("USE_GPU_PLACEHOLDER");
-    // std::vector<typename Curve::AffineElement> gpu_results;
-    // bool gpu_success = false;
-    
-    // if (use_gpu_env != nullptr && strcmp(use_gpu_env, "1") == 0) {
-    //     std::cout << "\n--- GPU PIPPENGER COMPARISON STARTING ---" << std::endl;
-        
-    //     void* cuda_msm_lib = dlopen("./libcuda_msm_pippenger.so", RTLD_LAZY);
-    //     if (!cuda_msm_lib) {
-    //         cuda_msm_lib = dlopen("/root/aztec-packages/barretenberg/cpp/src/barretenberg/gpu/libcuda_msm_pippenger.so", RTLD_LAZY);
-    //     }
-        
-    //     if (cuda_msm_lib) {
-    //         std::cout << "--- CUDA PIPPENGER LIBRARY FOUND ---" << std::endl;
-            
-    //         typedef int (*gpu_pippenger_msm_t)(void*, const void*, const void*, size_t);
-    //         gpu_pippenger_msm_t gpu_pippenger_msm = 
-    //             (gpu_pippenger_msm_t)dlsym(cuda_msm_lib, "gpu_pippenger_msm");
-            
-    //         if (gpu_pippenger_msm && points.size() > 0) {
-    //             gpu_results.resize(points.size());
-    //             typename Curve::AffineElement gpu_result;
-    //             if (gpu_pippenger_msm(&gpu_result, points[0].data(), scalars[0].data(), points[0].size()) == 0) {
-    //                 std::cout << "--- GPU PIPPENGER COMPLETED ---" << std::endl;
-    //                 gpu_results[0] = gpu_result;
-    //                 gpu_success = true;
-    //             }
-    //         }
-    //         dlclose(cuda_msm_lib);
-    //     } else {
-    //         std::cout << "--- CUDA PIPPENGER LIBRARY NOT FOUND ---" << std::endl;
-    //     }
-        
-    //     std::cout << "\n--- NOW RUNNING CPU FOR COMPARISON ---" << std::endl;
-    // }
     ASSERT(points.size() == scalars.size());
     const size_t num_msms = points.size();
-
-    // std::cout << "\n=== CPU BATCH MSM DETAILED ANALYSIS ===" << std::endl;
-    // std::cout << "Number of MSM spans: " << num_msms << std::endl;
-    
-    // Log input data details
-    // for (size_t i = 0; i < num_msms && i < 1; i++) {
-    //     std::cout << "Span " << i << ":" << std::endl;
-    //     std::cout << "  Points count: " << points[i].size() << std::endl;
-    //     std::cout << "  Scalars count: " << scalars[i].size() << std::endl;
-        
-    //     // Show first few points and scalars
-    //     for (size_t j = 0; j < std::min((size_t)3, points[i].size()); j++) {
-    //         std::cout << "  Point[" << j << "].x: " << std::hex << points[i][j].x << std::dec << std::endl;
-    //         std::cout << "  Point[" << j << "].y: " << std::hex << points[i][j].y << std::dec << std::endl;
-    //         std::cout << "  Scalar[" << j << "]: " << std::hex << scalars[i][j] << std::dec << std::endl;
-    //     }
-    // }
 
     // CHECK: Is this the placeholder implementation?
     const char* debug_env = std::getenv("DEBUG_CPU_MSM");
     if (debug_env != nullptr && strcmp(debug_env, "1") == 0) {
-        // std::cout << "=== USING PLACEHOLDER CPU IMPLEMENTATION (DEBUG MODE) ===" << std::endl;
         typename Curve::AffineElement result = Curve::AffineElement::infinity();
         
         for (size_t i = 0; i < points.size(); ++i) {
-            // std::cout << "Span " << i << ": " << points[i].size() << " points" << std::endl;
             for (size_t j = 0; j < points[i].size() && j < 3; ++j) {
-                // std::cout << "  Point " << j << " * Scalar " << j << std::endl;
                 result = result + (points[i][j] * scalars[i][j]);
             }
         }
         
-        // std::cout << "=== PLACEHOLDER CPU RESULT ===" << std::endl;
-        // std::cout << "Result x: " << std::hex << result.x << std::dec << std::endl;
         return std::vector<typename Curve::AffineElement>{result};
     }
-    
-    // std::cout << "=== USING REAL PIPPENGER CPU IMPLEMENTATION ===" << std::endl;
 
     // Step 1: Transform scalar indices
-    // std::cout << "Step 1: Getting work units and scalar indices..." << std::endl;
     std::vector<std::vector<uint32_t>> msm_scalar_indices;
     std::vector<ThreadWorkUnits> thread_work_units = get_work_units(scalars, msm_scalar_indices);
     const size_t num_cpus = get_num_cpus();
-    // std::cout << "  CPU threads: " << num_cpus << std::endl;
-    // std::cout << "  Work unit groups: " << thread_work_units.size() << std::endl;
-    
-    // Log work unit details
-    // for (size_t i = 0; i < thread_work_units.size() && i < 2; i++) {
-    //     // std::cout << "  Thread " << i << " work units: " << thread_work_units[i].size() << std::endl;
-    //     for (size_t j = 0; j < thread_work_units[i].size() && j < 2; j++) {
-    //         const auto& wu = thread_work_units[i][j];
-    //         // std::cout << "    Work unit " << j << ": batch_idx=" << wu.batch_msm_index 
-    //         //           << ", start=" << wu.start_index << ", size=" << wu.size << std::endl;
-    //     }
-    // }
     std::vector<std::vector<std::pair<Element, size_t>>> thread_msm_results(num_cpus);
     BB_ASSERT_EQ(thread_work_units.size(), num_cpus);
 
     // Step 2: Execute parallel MSM computations
-    // std::cout << "Step 2: Executing parallel MSM computations..." << std::endl;
     parallel_for(num_cpus, [&](size_t thread_idx) {
         if (!thread_work_units[thread_idx].empty()) {
             const std::vector<MSMWorkUnit>& msms = thread_work_units[thread_idx];
             std::vector<std::pair<Element, size_t>>& msm_results = thread_msm_results[thread_idx];
-            
-            // Log thread activity (only for first thread to avoid spam)
-            // if (thread_idx == 0) {
-            //     std::cout << "  Thread 0 processing " << msms.size() << " work units..." << std::endl;
-            // }
             
             for (const MSMWorkUnit& msm : msms) {
                 std::span<const ScalarField> work_scalars = scalars[msm.batch_msm_index];
@@ -964,41 +914,9 @@ std::vector<typename Curve::AffineElement> MSM<Curve>::batch_multi_scalar_mul(
                 Element msm_result = Curve::Group::point_at_infinity;
                 constexpr size_t SINGLE_MUL_THRESHOLD = 16;
                 
-                if (thread_idx == 0) {
-                    // std::cout << "    Thread 0 Work Unit Details:" << std::endl;
-                    // std::cout << "      Work unit size: " << msm.size << std::endl;
-                    // std::cout << "      Start index: " << msm.start_index << std::endl;
-                    // std::cout << "      Batch MSM index: " << msm.batch_msm_index << std::endl;
-                    // std::cout << "      Scalar indices size: " << msm_data.scalar_indices.size() << std::endl;
-                    // std::cout << "      Algorithm: " << (msm.size < SINGLE_MUL_THRESHOLD ? "small_mul" : 
-                    //                                    (handle_edge_cases ? "small_pippenger_low_memory" : "pippenger_low_memory")) << std::endl;
-                    
-                    // Show first few scalar indices
-                    // std::cout << "      First 3 scalar indices: ";
-                    // for (size_t i = 0; i < std::min((size_t)3, msm_data.scalar_indices.size()); i++) {
-                    //     std::cout << msm_data.scalar_indices[i] << " ";
-                    // }
-                    // std::cout << std::endl;
-                    
-                    // Show first few scalars and points this thread will process
-                    // std::cout << "      First 3 scalars/points this thread processes:" << std::endl;
-                    // for (size_t i = 0; i < std::min((size_t)3, msm_data.scalar_indices.size()); i++) {
-                    //     uint32_t idx = msm_data.scalar_indices[i];
-                    //     std::cout << "        [" << i << "] scalar_idx=" << idx 
-                    //               << " scalar=" << std::hex << work_scalars[idx] << std::dec
-                    //               << " point.x=" << std::hex << work_points[idx].x << std::dec << std::endl;
-                    // }
-                }
-                
                 if (msm.size < SINGLE_MUL_THRESHOLD) {
-                    // if (thread_idx == 0) {
-                    //     std::cout << "      Executing small_mul..." << std::endl;
-                    // }
                     msm_result = small_mul<Curve>(work_scalars, work_points, msm_data.scalar_indices, msm.size);
                 } else {
-                    // if (thread_idx == 0) {
-                    //     std::cout << "      Executing " << (handle_edge_cases ? "small_pippenger_low_memory" : "pippenger_low_memory") << "..." << std::endl;
-                    // }
                     // Our non-affine method implicitly handles cases where Weierstrass edge cases may occur
                     // Note: not as fast! use unsafe version if you know all input base points are linearly independent
                     if (handle_edge_cases) {
@@ -1008,29 +926,16 @@ std::vector<typename Curve::AffineElement> MSM<Curve>::batch_multi_scalar_mul(
                     }
                 }
                 
-                // if (thread_idx == 0) {
-                //     std::cout << "      Thread 0 result: x=" << std::hex << msm_result.x << std::dec << std::endl;
-                // }
-                
                 msm_results.push_back(std::make_pair(msm_result, msm.batch_msm_index));
             }
         }
     });
 
     // Step 3: Accumulate results from all threads
-    // std::cout << "Step 3: Accumulating results from " << num_cpus << " threads..." << std::endl;
     std::vector<Element> results(num_msms);
     for (Element& ele : results) {
         ele.self_set_infinity();
     }
-    
-    // Count total results
-    size_t total_results = 0;
-    for (const auto& single_thread_msm_results : thread_msm_results) {
-        total_results += single_thread_msm_results.size();
-        // std::cout << "  Thread results: " << single_thread_msm_results.size() << std::endl;
-    }
-    // std::cout << "  Total partial results to accumulate: " << total_results << std::endl;
     
     for (const auto& single_thread_msm_results : thread_msm_results) {
         for (const std::pair<Element, size_t>& result : single_thread_msm_results) {
@@ -1038,17 +943,13 @@ std::vector<typename Curve::AffineElement> MSM<Curve>::batch_multi_scalar_mul(
         }
     }
     
-    // std::cout << "Step 4: Batch normalizing " << num_msms << " results..." << std::endl;
+    // Step 4: Batch normalize
     Element::batch_normalize(&results[0], num_msms);
 
     std::vector<AffineElement> affine_results;
     for (const auto& ele : results) {
         affine_results.emplace_back(AffineElement(ele.x, ele.y));
     }
-    
-    // std::cout << "=== REAL PIPPENGER CPU RESULT ===" << std::endl;
-    // std::cout << "CPU Result x: " << std::hex << affine_results[0].x << std::dec << std::endl;
-    // std::cout << "CPU Result y: " << std::hex << affine_results[0].y << std::dec << std::endl;
 
     // Convert our scalars back into Montgomery form so they remain unchanged
     for (auto& msm_scalars : scalars) {
@@ -1058,26 +959,6 @@ std::vector<typename Curve::AffineElement> MSM<Curve>::batch_multi_scalar_mul(
             }
         });
     }
-    
-    // // GPU PIPPENGER COMPARISON RESULTS
-    // if (use_gpu_env != nullptr && strcmp(use_gpu_env, "1") == 0) {
-    //     std::cout << "\n=== GPU/CPU PIPPENGER COMPARISON ===" << std::endl;
-    //     std::cout << "Expected CPU result: " << std::hex << affine_results[0].x << std::dec << std::endl;
-        
-    //     if (gpu_success) {
-    //         std::cout << "GPU Pippenger result: " << std::hex << gpu_results[0].x << std::dec << std::endl;
-            
-    //         bool results_match = (affine_results[0].x == gpu_results[0].x) && (affine_results[0].y == gpu_results[0].y);
-    //         std::cout << "Results match: " << (results_match ? "✓ YES" : "✗ NO") << std::endl;
-            
-    //         if (!results_match) {
-    //             std::cout << "=== ANALYSIS ===" << std::endl;
-    //             std::cout << "This is expected - GPU implementation is simplified for structure testing" << std::endl;
-    //             std::cout << "Next step: Implement proper Pippenger arithmetic on GPU" << std::endl;
-    //         }
-    //     }
-    //     std::cout << "=== RETURNING CPU RESULT (CORRECT) ===" << std::endl;
-    // }
     
     return affine_results;
 }
