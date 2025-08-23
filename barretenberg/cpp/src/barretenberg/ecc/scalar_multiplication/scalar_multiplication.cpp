@@ -19,6 +19,21 @@
 #include "barretenberg/numeric/bitop/get_msb.hpp"
 
 #include <dlfcn.h>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <iostream>
+#include <sstream>
+#include <cstdlib>
+#include <cstring>
+
+
+// Thread-safe GPU logging wrapper to prevent output garbling
+static std::mutex gpu_log_mutex;
+#define GPU_LOG(msg) do { \
+    std::lock_guard<std::mutex> lock(gpu_log_mutex); \
+    std::cout << msg << std::endl; \
+} while(0)
 
 namespace bb::scalar_multiplication {
 
@@ -573,13 +588,8 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
                                         size_t num_queued_affine_points) noexcept
 {
     auto consume_start = std::chrono::high_resolution_clock::now();
-    std::cout << "\n=== CONSUME_POINT_SCHEDULE DETAILED LOG ===" << std::endl;
-    std::cout << "INPUT: processing " << point_schedule.size() << " points" << std::endl;
-    std::cout << "INPUT: num_input_points_processed=" << num_input_points_processed << std::endl;
-    std::cout << "INPUT: num_queued_affine_points=" << num_queued_affine_points << std::endl;
     
-    // GPU Library Test - Step 2: Basic library loading and function call test
-    std::cout << "\n--- GPU LIBRARY TEST ---" << std::endl;
+    // GPU Library Loading - try different paths
     void* gpu_lib = dlopen("./libgpu_consume_point_schedule.so", RTLD_LAZY);
     if (!gpu_lib) {
         gpu_lib = dlopen("../gpu/libgpu_consume_point_schedule.so", RTLD_LAZY);
@@ -588,26 +598,9 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
         gpu_lib = dlopen("../../libgpu_consume_point_schedule.so", RTLD_LAZY);
     }
     
-    if (gpu_lib) {
-        std::cout << "GPU: Library loaded successfully!" << std::endl;
-        
-        // Try to get a test function
-        typedef int (*gpu_test_fn)();
-        gpu_test_fn test_fn = (gpu_test_fn)dlsym(gpu_lib, "gpu_test_function");
-        
-        if (test_fn) {
-            int result = test_fn();
-            std::cout << "GPU: Test function called, result=" << result << std::endl;
-        } else {
-            std::cout << "GPU: Test function not found in library" << std::endl;
-        }
-        
-        dlclose(gpu_lib);
-    } else {
-        std::cout << "GPU: Library not found, continuing with CPU only" << std::endl;
-        std::cout << "GPU: dlerror=" << dlerror() << std::endl;
+    if (!gpu_lib) {
+        GPU_LOG("GPU: Library not found, continuing with CPU only");
     }
-    std::cout << "--- END GPU LIBRARY TEST ---\n" << std::endl;
 
     size_t point_it = num_input_points_processed;
     size_t affine_input_it = num_queued_affine_points;
@@ -622,21 +615,6 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
     auto& output_point_schedule = affine_data.addition_result_bucket_destinations;
     AffineElement null_location{};
     
-    std::cout << "INIT: num_points=" << num_points << std::endl;
-    std::cout << "INIT: bucket_accumulators.size()=" << bucket_accumulators.size() << std::endl;
-    std::cout << "INIT: affine_addition_scratch_space.size()=" << affine_addition_scratch_space.size() << std::endl;
-    std::cout << "INIT: AffineAdditionData::BATCH_SIZE=" << AffineAdditionData::BATCH_SIZE << std::endl;
-    
-    // Log first few point_schedule entries
-    std::cout << "POINT_SCHEDULE[0-2]: ";
-    for (size_t i = 0; i < std::min((size_t)3, num_points); i++) {
-        uint64_t schedule = point_schedule[i];
-        size_t bucket = static_cast<size_t>(schedule) & 0xFFFFFFFF;
-        size_t point = static_cast<size_t>(schedule >> 32);
-        std::cout << "[bucket=" << bucket << ",point=" << point << "] ";
-    }
-    std::cout << std::endl;
-    
     // We do memory prefetching, `prefetch_max` ensures we do not overflow our containers
     size_t prefetch_max = (num_points - 32);
     if (num_points < 32) {
@@ -646,14 +624,130 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
     if (num_points == 0) {
         end = 0;
     }
+
+    // CHATGPT-5 POINT #6: Debounce "Skipped" log spam
+    static size_t skipped_log_count = 0;
+    static const size_t SKIPPED_LOG_DEBOUNCE_INTERVAL = 100;  // Log every 100th skip
     
-    std::cout << "BOUNDS: prefetch_max=" << prefetch_max << ", end=" << end << std::endl;
+    // Debounce GPU initialization messages - only log once per execution
+    static bool gpu_init_logged = false;
+    
+    // Debounce high-frequency GPU validation messages
+    static size_t sequential_batch_count = 0;
+    static const size_t GPU_VALIDATION_LOG_INTERVAL = 50;  // Log every 50th validation
+    
+    // PHASE 1: Validation statistics tracking
+    static size_t total_gpu_validations = 0;
+    static size_t successful_gpu_validations = 0;
+    static size_t failed_gpu_validations = 0;
+    static size_t total_gpu_iterations_processed = 0;
+    static const size_t VALIDATION_STATS_INTERVAL = 100;  // Log stats every 100 validations
+
+    // PHASE 1: Validation regression test function
+    auto validate_gpu_cpu_consistency = [&](const char* phase_name, 
+                                           size_t cpu_point_it, size_t gpu_point_it,
+                                           size_t cpu_affine_it, size_t gpu_affine_it,
+                                           size_t gpu_iterations) -> bool {
+        bool states_match = (cpu_point_it == gpu_point_it) && (cpu_affine_it == gpu_affine_it);
+        
+        // Update statistics
+        total_gpu_validations++;
+        total_gpu_iterations_processed += gpu_iterations;
+        
+        if (states_match) {
+            successful_gpu_validations++;
+            return true;
+        } else {
+            failed_gpu_validations++;
+            GPU_LOG("VALIDATION REGRESSION DETECTED in " << phase_name);
+            GPU_LOG("  CPU final state: point_it=" << cpu_point_it << ", affine_it=" << cpu_affine_it);
+            GPU_LOG("  GPU final state: point_it=" << gpu_point_it << ", affine_it=" << gpu_affine_it);
+            GPU_LOG("  Validation success rate: " << (100.0 * static_cast<double>(successful_gpu_validations) / static_cast<double>(total_gpu_validations)) << "%");
+            return false;
+        }
+    };
 
     // Step 1: Fill up `affine_addition_scratch_space` with up to AffineAdditionData::BATCH_SIZE/2 independent additions
-    std::cout << "\nSTEP1: Starting main processing loop" << std::endl;
-    std::cout << "LOOP_INIT: affine_input_it=" << affine_input_it << ", point_it=" << point_it << ", end=" << end << std::endl;
     
-    size_t loop_iteration = 0;
+    // GPU Acceleration: Process first 100 iterations on GPU
+    struct GPUProcessingResult {
+        size_t new_point_it;
+        size_t new_affine_input_it;
+        size_t iterations_processed;
+    };
+    
+    // Structure for CPU-GPU validation comparison
+    struct CPUGPUIterationResult {
+        size_t point_it_advance;     // How much point_it advanced
+        bool do_affine_add;          // Whether this iteration would do affine add
+        size_t lhs_bucket;           // Left bucket value
+        size_t rhs_bucket;           // Right bucket value
+        bool buckets_match;          // Whether buckets matched
+    };
+    
+    // GPUProcessingResult gpu_results = {point_it, affine_input_it, 0}; // Unused - removed for iteration validation
+    
+    // Setup GPU acceleration with bulk comparison approach
+    typedef int (*gpu_bulk_process_fn)(const uint64_t*, size_t, size_t, uint64_t*, size_t, size_t, size_t*, size_t*, size_t*, int, int);  // CHATGPT-5 POINT #1: Added validation flags
+    
+    gpu_bulk_process_fn gpu_bulk_fn = nullptr;  // New: Process entire batch and return final state
+    
+    // Test mode selection (can be controlled via environment variable)
+    const char* gpu_mode = std::getenv("GPU_SYNC_MODE");
+    bool use_bulk_comparison = (gpu_mode == nullptr || strcmp(gpu_mode, "bulk") == 0); // Default to bulk
+    
+    // Keep old approaches for fallback
+    typedef int (*gpu_large_batch_fn)(const uint64_t*, size_t, size_t, const uint64_t*, size_t, CPUGPUIterationResult*, size_t);
+    typedef int (*gpu_single_iteration_fn)(const uint64_t*, size_t, size_t, const uint64_t*, size_t, CPUGPUIterationResult*);
+    gpu_large_batch_fn cuda_batch_fn = nullptr;
+    gpu_single_iteration_fn cuda_single_fn = nullptr;
+    CPUGPUIterationResult* cuda_batch_results = nullptr;
+    size_t cuda_batch_size = 100;
+    bool use_single_iteration = (gpu_mode != nullptr && strcmp(gpu_mode, "single") == 0);
+    
+    // Fallback debug function for validation
+    typedef int (*gpu_debug_single_fn)(const uint64_t*, size_t, size_t, const uint64_t*, size_t, CPUGPUIterationResult*);
+    gpu_debug_single_fn validate_fn = nullptr;
+    
+    if (gpu_lib) {
+        gpu_bulk_fn = (gpu_bulk_process_fn)dlsym(gpu_lib, "gpu_process_entire_batch");
+        cuda_batch_fn = (gpu_large_batch_fn)dlsym(gpu_lib, "gpu_large_batch_cuda");
+        cuda_single_fn = (gpu_single_iteration_fn)dlsym(gpu_lib, "gpu_single_iteration_cuda");
+        validate_fn = (gpu_debug_single_fn)dlsym(gpu_lib, "gpu_debug_single_iteration");
+        
+        // Only log GPU initialization messages once per execution to prevent spam
+        if (!gpu_init_logged) {
+            if (use_bulk_comparison && gpu_bulk_fn) {
+                GPU_LOG("GPU: Bulk comparison CUDA acceleration enabled (entire batch validation)");
+            } else if (use_single_iteration && cuda_single_fn) {
+                GPU_LOG("GPU: Single-iteration CUDA acceleration enabled (perfect state sync)");
+            } else if (cuda_batch_fn) {
+                GPU_LOG("GPU: Sequential batch CUDA acceleration enabled (100 iterations per batch)");
+            } else if (validate_fn) {
+                GPU_LOG("GPU: Falling back to debug validation (no CUDA functions)");
+            } else {
+                GPU_LOG("GPU: No GPU functions found, falling back to CPU-only computation");
+            }
+            gpu_init_logged = true;
+        }
+        
+        // Always allocate cuda_batch_results if needed, regardless of logging
+        if (cuda_batch_fn && !cuda_batch_results) {
+            cuda_batch_results = new CPUGPUIterationResult[cuda_batch_size];
+        }
+    }
+    
+    // Initialize GPU bulk variables (GPU processing will happen AFTER CPU completes)
+    size_t gpu_final_point_it = point_it;
+    size_t gpu_final_affine_it = affine_input_it;
+    size_t gpu_iterations_processed = 0;
+    bool gpu_bulk_success = false;
+    
+    // Store initial state for comparison
+    size_t cpu_initial_point_it = point_it;
+    size_t cpu_initial_affine_it = affine_input_it;  // FIXED: Store initial affine state
+    size_t validation_count = 0;
+    
     while (((affine_input_it + 1) < AffineAdditionData::BATCH_SIZE) && (point_it < end)) {
 
         // we prefetchin'
@@ -682,24 +776,88 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
         size_t lhs_point = static_cast<size_t>(lhs_schedule >> 32);
         size_t rhs_point = static_cast<size_t>(rhs_schedule >> 32);
 
+        // Always do CPU calculations (restored normal behavior)
         bool has_bucket_accumulator = bucket_accumulator_exists.get(lhs_bucket);
         bool buckets_match = lhs_bucket == rhs_bucket;
         bool do_affine_add = buckets_match || has_bucket_accumulator;
         
-        // Log first few iterations
-        if (loop_iteration < 3) {
-            std::cout << "ITER[" << loop_iteration << "]: point_it=" << point_it << " affine_input_it=" << affine_input_it << std::endl;
-            std::cout << "  lhs_bucket=" << lhs_bucket << " rhs_bucket=" << rhs_bucket << std::endl;
-            std::cout << "  lhs_point=" << lhs_point << " rhs_point=" << rhs_point << std::endl;
-            std::cout << "  has_bucket_acc=" << has_bucket_accumulator << " buckets_match=" << buckets_match << " do_affine_add=" << do_affine_add << std::endl;
-            std::cout << "  lhs_point.x=" << std::hex << points[lhs_point].x << std::dec << std::endl;
-            std::cout << "  lhs_point.y=" << std::hex << points[lhs_point].y << std::dec << std::endl;
-            if (buckets_match) {
-                std::cout << "  rhs_point.x=" << std::hex << points[rhs_point].x << std::dec << std::endl;
-                std::cout << "  rhs_point.y=" << std::hex << points[rhs_point].y << std::dec << std::endl;
-            } else if (has_bucket_accumulator) {
-                std::cout << "  bucket_acc.x=" << std::hex << bucket_accumulators[lhs_bucket].x << std::dec << std::endl;
-                std::cout << "  bucket_acc.y=" << std::hex << bucket_accumulators[lhs_bucket].y << std::dec << std::endl;
+        // GPU validation for debugging (does not affect CPU calculations)
+        if (validation_count < 25) {
+            CPUGPUIterationResult gpu_result;
+            bool gpu_success = false;
+            size_t cpu_point_advance = (do_affine_add && buckets_match) ? 2 : 1;
+            
+            if (use_single_iteration && cuda_single_fn) {
+                // SOLUTION 2: Single-iteration processing for perfect state sync
+                int status = cuda_single_fn(point_schedule.data(), point_it, end,
+                                          bucket_accumulator_exists.raw_data(),
+                                          bucket_accumulator_exists.size(),
+                                          &gpu_result);
+                gpu_success = (status == 0);
+                
+                if (validation_count < 5) {
+                    GPU_LOG("GPU SINGLE[" << validation_count << "] point_it=" << point_it);
+                }
+            } else if (cuda_batch_fn && cuda_batch_results) {
+                // SOLUTION 1: Sequential batch processing with state simulation
+                if (validation_count % cuda_batch_size == 0) {
+                    // Launch CUDA batch for next 100 iterations
+                    int cuda_processed = cuda_batch_fn(point_schedule.data(), point_it, end,
+                                                     bucket_accumulator_exists.raw_data(),
+                                                     bucket_accumulator_exists.size(),
+                                                     cuda_batch_results,
+                                                     cuda_batch_size);
+                    
+                    if (cuda_processed > 0) {
+                        // Debounce sequential batch success messages
+                        sequential_batch_count++;
+                        if (sequential_batch_count % GPU_VALIDATION_LOG_INTERVAL == 0) {
+                            GPU_LOG("GPU SEQUENTIAL BATCH: Successfully processed " << sequential_batch_count << " batches (" << cuda_processed << " iterations latest)");
+                        }
+                    } else {
+                        GPU_LOG("GPU SEQUENTIAL BATCH: Failed, continuing with CPU-only");
+                        cuda_batch_fn = nullptr;
+                    }
+                }
+                
+                if (cuda_batch_fn) {
+                    size_t batch_index = validation_count % cuda_batch_size;
+                    gpu_result = cuda_batch_results[batch_index];
+                    gpu_success = true;
+                    
+                    if (validation_count < 5) {
+                        GPU_LOG("GPU BATCH[" << validation_count << "] batch_idx=" << batch_index << " point_it=" << point_it);
+                    }
+                }
+            }
+            
+            // Compare GPU results with CPU for debugging
+            if (gpu_success) {
+                bool results_match = (gpu_result.lhs_bucket == lhs_bucket) &&
+                                   (gpu_result.rhs_bucket == rhs_bucket) &&
+                                   (gpu_result.buckets_match == buckets_match) &&
+                                   (gpu_result.do_affine_add == do_affine_add) &&
+                                   (gpu_result.point_it_advance == cpu_point_advance);
+                
+                // Log for first few iterations (reduced frequency for cleaner output)
+                if (validation_count < 5) {
+                    GPU_LOG("  CPU: buckets=" << lhs_bucket << "," << rhs_bucket 
+                              << " has_bucket_accum=" << has_bucket_accumulator
+                              << " match=" << buckets_match 
+                              << " do_affine_add=" << do_affine_add 
+                              << " advance=" << cpu_point_advance);
+                    GPU_LOG("  GPU: buckets=" << gpu_result.lhs_bucket << "," << gpu_result.rhs_bucket 
+                              << " match=" << gpu_result.buckets_match 
+                              << " do_affine_add=" << gpu_result.do_affine_add 
+                              << " advance=" << gpu_result.point_it_advance);
+                    
+                    if (results_match) {
+                        GPU_LOG("  STATUS: PERFECT SYNC MATCH (CPU logic used)");
+                    } else {
+                        GPU_LOG("  STATUS: SYNC MISMATCH (CPU logic used)");
+                    }
+                }
+                validation_count++;
             }
         }
 
@@ -729,22 +887,25 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
 
         affine_input_it += do_affine_add ? 2 : 0;
         point_it += (do_affine_add && buckets_match) ? 2 : 1;
-        
-        // Log first few iterations results
-        if (loop_iteration < 3) {
-            std::cout << "  RESULT: affine_input_it=" << affine_input_it << " point_it=" << point_it << std::endl;
-        }
-        loop_iteration++;
     }
+    
+    // PHASE A: Log CPU main loop exit condition
+    GPU_LOG("CPU DEBUG: Main loop exit - point_it=" << point_it << " num_points=" << num_points 
+            << " condition=" << (point_it < (num_points - 1))
+            << " will_handle_edge_case=" << (point_it == num_points - 1));
+    
     // We have to handle the last point as an edge case so that we dont overflow the bounds of `point_schedule`. If the
     // bucket accumulator exists, we add the point to it, otherwise the point simply becomes the bucket accumulator.
     if (point_it == num_points - 1) {
+        GPU_LOG("CPU DEBUG: Processing EDGE CASE for last point at point_it=" << point_it);
         uint64_t lhs_schedule = point_schedule[point_it];
         size_t lhs_bucket = static_cast<size_t>(lhs_schedule) & 0xFFFFFFFF;
         size_t lhs_point = static_cast<size_t>(lhs_schedule >> 32);
         bool has_bucket_accumulator = bucket_accumulator_exists.get(lhs_bucket);
 
         if (has_bucket_accumulator) { // point is added to its bucket accumulator
+            GPU_LOG("CPU DEBUG: Edge case - adding point to existing bucket, affine_it=" 
+                    << affine_input_it << "→" << (affine_input_it + 2));
             affine_addition_scratch_space[affine_input_it] = points[lhs_point];
             affine_addition_scratch_space[affine_input_it + 1] = bucket_accumulators[lhs_bucket];
             bucket_accumulator_exists.set(lhs_bucket, false);
@@ -752,34 +913,20 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
             affine_input_it += 2;
             point_it += 1;
         } else { // otherwise, cache the point into the bucket
+            GPU_LOG("CPU DEBUG: Edge case - caching point into bucket, point_it=" 
+                    << point_it << "→" << (point_it + 1));
             BB_ASSERT_LT(lhs_point, points.size());
             bucket_accumulators[lhs_bucket] = points[lhs_point];
             bucket_accumulator_exists.set(lhs_bucket, true);
             point_it += 1;
         }
     }
-    
-    std::cout << "\nSTEP1_COMPLETE: Main loop finished" << std::endl;
-    std::cout << "FINAL_STATE: point_it=" << point_it << " affine_input_it=" << affine_input_it << " total_iterations=" << loop_iteration << std::endl;
 
     // Now that we have populated `affine_addition_scratch_space`,
     // compute `num_affine_points_to_add` independent additions using the Affine trick
     size_t num_affine_points_to_add = affine_input_it;
-    std::cout << "\nSTEP2: About to call add_affine_points with " << num_affine_points_to_add << " points" << std::endl;
-    
-    // Log first few points that will be added
-    std::cout << "AFFINE_INPUT[0-2]: ";
-    for (size_t i = 0; i < std::min((size_t)6, num_affine_points_to_add); i += 2) {
-        std::cout << "[(" << std::hex << affine_addition_scratch_space[i].x << "," << affine_addition_scratch_space[i].y 
-                  << ")+(" << affine_addition_scratch_space[i+1].x << "," << affine_addition_scratch_space[i+1].y << std::dec << ")] ";
-    }
-    std::cout << std::endl;
     if (num_affine_points_to_add >= 2) {
-        auto affine_start = std::chrono::high_resolution_clock::now();
         add_affine_points(&affine_addition_scratch_space[0], num_affine_points_to_add, &scalar_scratch_space[0]);
-        auto affine_end = std::chrono::high_resolution_clock::now();
-        auto affine_duration = std::chrono::duration_cast<std::chrono::microseconds>(affine_end - affine_start);
-        std::cout << "CPU: add_affine_points call took " << affine_duration.count() << " microseconds" << std::endl;
     }
     // `add_affine_points` stores the result in the top-half of the used scratch space
     G1* affine_output = &affine_addition_scratch_space[0] + (num_affine_points_to_add / 2);
@@ -849,9 +996,161 @@ void MSM<Curve>::consume_point_schedule(std::span<const uint64_t> point_schedule
         consume_point_schedule(point_schedule, points, affine_data, bucket_data, point_it, new_scratch_space_it);
     }
     
+    // BULK GPU PROCESSING: Run GPU on same range that CPU just processed
+    size_t cpu_final_point_it = point_it;
+    size_t cpu_final_affine_it = affine_input_it;
+    
+    if (use_bulk_comparison && gpu_bulk_fn) {
+        // CRITICAL FIX: Only call GPU if CPU actually processed some points (start < end)
+        if (cpu_initial_point_it < cpu_final_point_it) {
+            // Pass the initial affine_input_it state to GPU so it starts from the correct position
+            
+            // CHATGPT-5 POINT #1: Call GPU with read-only validation mode
+        int gpu_status = gpu_bulk_fn(point_schedule.data(), cpu_initial_point_it, cpu_final_point_it,
+                                        bucket_accumulator_exists.raw_data(),
+                                        bucket_accumulator_exists.size(),
+                                        cpu_initial_affine_it,
+                                        &gpu_final_point_it,
+                                        &gpu_final_affine_it,
+                                        &gpu_iterations_processed,
+                                        0,  // apply_updates=1 (mirror CPU state changes)
+                                        0); // respect_affine_capacity=0 (still no gating for validation)
+            
+            gpu_bulk_success = (gpu_status == 0);
+            if (gpu_bulk_success) {
+                GPU_LOG("GPU BULK: Successfully processed " << gpu_iterations_processed 
+                          << " iterations, final point_it=" << gpu_final_point_it 
+                          << ", affine_it=" << gpu_final_affine_it);
+            } else {
+                GPU_LOG("GPU BULK: Failed, will compare with partial CPU results");
+            }
+        } else {
+            // CHATGPT-5 POINT #6: Debounce "Skipped" log spam - only log every Nth occurrence
+            skipped_log_count++;
+            if (skipped_log_count % SKIPPED_LOG_DEBOUNCE_INTERVAL == 0) {
+                GPU_LOG("GPU BULK: Skipped " << skipped_log_count << " times (CPU processed no points, latest: start=" 
+                          << cpu_initial_point_it << " end=" << cpu_final_point_it << ")");
+            }
+            gpu_bulk_success = false;  // GPU was not called, so no success
+        }
+    }
+    
+    // OPTION B: Replace CPU results with GPU results when GPU processing succeeds
+    if (gpu_bulk_success && use_bulk_comparison) {
+        // size_t cpu_iterations_processed = cpu_final_point_it - cpu_initial_point_it;  // Commented out with logs
+        
+        // COMMENTED OUT: Bulk comparison logs (too verbose for debugging)
+        // std::cout << "GPU BULK COMPARISON:" << std::endl;
+        // std::cout << "  CPU: processed " << cpu_iterations_processed << " iterations, "
+        //           << "final point_it=" << cpu_final_point_it << ", affine_it=" << cpu_final_affine_it << std::endl;
+        // std::cout << "  GPU: processed " << gpu_iterations_processed << " iterations, "
+        //           << "final point_it=" << gpu_final_point_it << ", affine_it=" << gpu_final_affine_it << std::endl;
+        
+        // PHASE 1: Use validation regression test function
+        bool validation_passed = validate_gpu_cpu_consistency("BULK_VALIDATION", 
+                                                              cpu_final_point_it, gpu_final_point_it,
+                                                              cpu_final_affine_it, gpu_final_affine_it,
+                                                              gpu_iterations_processed);
+        
+        // PHASE 1: Periodic comprehensive validation statistics
+        if (total_gpu_validations % VALIDATION_STATS_INTERVAL == 0) {
+            double success_rate = 100.0 * static_cast<double>(successful_gpu_validations) / static_cast<double>(total_gpu_validations);
+            double avg_iterations = static_cast<double>(total_gpu_iterations_processed) / static_cast<double>(total_gpu_validations);
+            
+            GPU_LOG("PHASE 1 VALIDATION SUMMARY (after " << total_gpu_validations << " validations):");
+            GPU_LOG("  Success rate: " << success_rate << "% (" << successful_gpu_validations << "/" << total_gpu_validations << ")");
+            GPU_LOG("  Failed validations: " << failed_gpu_validations);
+            GPU_LOG("  Total GPU iterations: " << total_gpu_iterations_processed);
+            GPU_LOG("  Average iterations per validation: " << avg_iterations);
+            
+            // PHASE 1: Regression test criteria
+            if (success_rate < 99.0) {
+                GPU_LOG("WARNING: GPU validation success rate below 99% - consider investigation");
+            }
+            if (failed_gpu_validations > 0) {
+                GPU_LOG("ALERT: GPU validation failures detected - manual review recommended");
+            }
+        }
+        
+        if (validation_passed) {
+            // PHASE 1: Validation passed - could potentially use GPU results (but staying in validation mode for now)
+            point_it = gpu_final_point_it;        // Update main loop iterator
+            affine_input_it = gpu_final_affine_it; // Update affine iterator
+        } else {
+            // PHASE 1: Validation failed - continue with CPU results
+            GPU_LOG("PHASE 1: Continuing with CPU results due to validation failure");
+        }
+    }
+    
+    // PHASE 1: Final test validation summary (printed at end of each consume_point_schedule call)
+    static bool final_summary_logged = false;
+    if (!final_summary_logged && total_gpu_validations > 0) {
+        // Only log final summary once we have significant validation data
+        if (total_gpu_validations >= 50) {
+            double final_success_rate = 100.0 * static_cast<double>(successful_gpu_validations) / static_cast<double>(total_gpu_validations);
+            double avg_iterations = static_cast<double>(total_gpu_iterations_processed) / static_cast<double>(total_gpu_validations);
+            
+            GPU_LOG("=== PHASE 1 FINAL VALIDATION SUMMARY ===");
+            GPU_LOG("Total GPU validations: " << total_gpu_validations);
+            GPU_LOG("Successful validations: " << successful_gpu_validations << " (" << final_success_rate << "%)");
+            GPU_LOG("Failed validations: " << failed_gpu_validations);
+            GPU_LOG("Total GPU iterations processed: " << total_gpu_iterations_processed);
+            GPU_LOG("Average iterations per validation: " << avg_iterations);
+            
+            // PHASE 1: Readiness assessment for Phase 2
+            bool ready_for_phase_2 = (final_success_rate >= 99.9) && (failed_gpu_validations == 0) && (total_gpu_validations >= 50);
+            
+            if (ready_for_phase_2) {
+                GPU_LOG("✅ PHASE 1 COMPLETE: GPU validation is stable and reliable");
+                GPU_LOG("✅ RECOMMENDATION: Ready to proceed to Phase 2 (Hybrid Processing Mode)");
+                GPU_LOG("✅ Success criteria met: >99.9% success rate, zero failures, 50+ validations");
+            } else {
+                GPU_LOG("⚠️  PHASE 1 INCOMPLETE: GPU validation needs improvement");
+                GPU_LOG("⚠️  RECOMMENDATION: Continue Phase 1 validation before proceeding");
+                if (final_success_rate < 99.9) {
+                    GPU_LOG("   - Success rate " << final_success_rate << "% below required 99.9%");
+                }
+                if (failed_gpu_validations > 0) {
+                    GPU_LOG("   - " << failed_gpu_validations << " validation failures detected (must be zero)");
+                }
+                if (total_gpu_validations < 50) {
+                    GPU_LOG("   - Only " << total_gpu_validations << " validations completed (need 50+)");
+                }
+            }
+            GPU_LOG("==========================================");
+            final_summary_logged = true;
+        }
+    }
+    
+    // Timing and GPU summary for development  
     auto consume_end = std::chrono::high_resolution_clock::now();
     auto consume_duration = std::chrono::duration_cast<std::chrono::microseconds>(consume_end - consume_start);
-    std::cout << "CPU: consume_point_schedule completed in " << consume_duration.count() << " microseconds" << std::endl;
+    {
+        std::ostringstream timing_msg;
+        timing_msg << "consume_point_schedule: " << consume_duration.count() << "μs";
+        
+        // Show GPU processing summary in same message
+        if (gpu_bulk_success && use_bulk_comparison) {
+            timing_msg << " (GPU bulk processed " << gpu_iterations_processed << " iterations)";
+        } else if ((cuda_batch_fn || validate_fn) && validation_count > 0) {
+            timing_msg << " (GPU processed " << validation_count << " iterations)";
+        }
+        
+        GPU_LOG(timing_msg.str());
+    }
+    
+    // Cleanup GPU batch results
+    if (cuda_batch_results) {
+        delete[] cuda_batch_results;
+        cuda_batch_results = nullptr;
+    }
+    
+    // GPU processing summary moved to timing message above for atomic output
+    
+    // Close GPU library
+    if (gpu_lib) {
+        dlclose(gpu_lib);
+    }
 }
 
 /**
